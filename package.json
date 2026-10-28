@@ -14,7 +14,7 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE", "docs"],
+  "files": ["dist", "README.md", "LICENSE", "docs", "examples"],
   "sideEffects": false,
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
