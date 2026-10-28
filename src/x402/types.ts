@@ -61,15 +61,19 @@ export const PaymentPayloadSchema = z.looseObject({
 });
 export type PaymentPayload = z.infer<typeof PaymentPayloadSchema>;
 
-/** Body of PAYMENT-RESPONSE / X-PAYMENT-RESPONSE (SettleResponse, notes §6). */
+/**
+ * Body of PAYMENT-RESPONSE / X-PAYMENT-RESPONSE (SettleResponse, notes §6). The optional fields accept null:
+ * real v1 facilitators send `"errorReason": null` on success (every v1 header in the harness database does),
+ * and rejecting that would drop the transaction hash. Diverges from x402-audit, which still uses .optional().
+ */
 export const SettlementResponseSchema = z.looseObject({
   success: z.boolean(),
   transaction: z.string(),
   network: z.string(),
-  payer: z.string().optional(),
-  errorReason: z.string().optional(),
-  errorMessage: z.string().optional(),
-  amount: z.string().optional(),
+  payer: z.string().nullish(),
+  errorReason: z.string().nullish(),
+  errorMessage: z.string().nullish(),
+  amount: z.string().nullish(),
 });
 export type SettlementResponse = z.infer<typeof SettlementResponseSchema>;
 

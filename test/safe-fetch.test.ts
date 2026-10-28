@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type SafeFetchOptions } from "../src/index.js";
-import { NETWORK, TX, fixture, startMock, type Mock } from "./mock.js";
+import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
 
 let mock: Mock;
 let dir: string;
@@ -277,7 +277,7 @@ describe("safeFetch: telemetry", () => {
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.1.0" });
+    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.2.0" });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
     for (const leak of ["secret", "abc", "tel-1", account.address.toLowerCase().slice(2), account.address.slice(2)]) expect(raw).not.toContain(leak);
@@ -297,5 +297,131 @@ describe("safeFetch: telemetry", () => {
     await client()(`${mock.base}/data`);
     await new Promise((r) => setTimeout(r, 100));
     expect(mock.st.telemetry).toEqual([]);
+  });
+});
+
+describe("safeFetch: verified telemetry (v2)", () => {
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+  const settle = () => new Promise((r) => setTimeout(r, 200));
+
+  it("posts a v2 row that matches the contract example field by field", async () => {
+    mock.st.mode = "conway_500";
+    indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.010000" } });
+    const res = await client({ telemetry: "verified" })(`${mock.base}/credits/topup/?secret=abc`, { method: "POST", body: '{"account":"acct_42"}' }, { intentId: "v2-1" });
+    expect(res.status).toBe(500);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+    const body = mock.st.telemetry[0] as Record<string, unknown>;
+    const contract = fixture("telemetry-v2-contract") as Record<string, unknown>;
+    const cproof = contract.proof as Record<string, unknown>;
+    const proof = body.proof as Record<string, unknown>;
+
+    // Same fields, same order, nothing extra, at both levels.
+    expect(Object.keys(body)).toEqual(Object.keys(contract));
+    expect(Object.keys(proof)).toEqual(Object.keys(cproof));
+
+    expect(body.v).toBe(contract.v);
+    expect(body.host).toBe("127.0.0.1");
+    expect(body.path_hash).toBe(sha("/credits/topup"));
+    expect(body.outcome).toBe(contract.outcome); // non_delivery
+    expect(body.amount_usdc).toBe("0.010000");
+    expect(body.amount_usdc).toMatch(/^\d+\.\d{6}$/);
+    expect(Number.isInteger(body.latency_ms)).toBe(true);
+    expect(body.validator_failures).toEqual(contract.validator_failures); // ["http_status:500"]
+    expect(body.client).toBe(contract.client);
+
+    expect(proof.network).toBe(NETWORK); // the contract example is mainnet; the mock seller is Base Sepolia
+    expect(proof.scheme).toBe(cproof.scheme);
+    expect(proof.asset).toBe(USDC_SEPOLIA.toLowerCase());
+    expect(proof.pay_to).toBe(payTo.toLowerCase());
+    expect(proof.payer).toBe(account.address.toLowerCase());
+    expect(proof.nonce).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(proof.tx_hash).toBe(TX);
+    expect(typeof proof.settled_at).toBe("string");
+    expect(new Date(proof.settled_at as string).toISOString()).toBe(proof.settled_at);
+    expect(proof.response_sha256).toBe(sha(JSON.stringify({ error: "internal error" })));
+    expect(proof.declared_timeout_s).toBe(cproof.declared_timeout_s); // 60, from the 402
+
+    // Bodies, query strings, request parameters and the intent id never leave the machine.
+    const raw = JSON.stringify(body);
+    for (const leak of ["secret", "abc", "acct_42", "internal error", "v2-1"]) expect(raw).not.toContain(leak);
+  });
+
+  it("writes proof and verification_url into the receipt, and replays carry them", async () => {
+    const f = client({ telemetry: "verified" });
+    const res = await f(`${mock.base}/data`, {}, { intentId: "v2-r" });
+    const r = res.receipt;
+    expect(r.reported_outcome).toBe("ok");
+    expect(r.payer).toBe(account.address.toLowerCase());
+    expect(r.proof).toMatchObject({ payer: r.payer, nonce: r.nonce, tx_hash: TX, declared_timeout_s: 60 });
+    expect(r.verification_url).toBe(`${mock.base}/v1/telemetry/${r.payer}/${r.nonce}`);
+    const onDisk = JSON.parse(await readFile(join(dir, (await receipts())[0]!), "utf8"));
+    expect(onDisk.proof).toEqual(r.proof);
+    expect(onDisk.verification_url).toBe(r.verification_url);
+    const again = await f(`${mock.base}/data`, {}, { intentId: "v2-r" });
+    expect(again.receipt).toMatchObject({ replayed: true, proof: r.proof, verification_url: r.verification_url });
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1); // a replay sends nothing
+  });
+
+  it("a refusal sends a v2 row without proof", async () => {
+    indexAnswer("check-avoid");
+    const f = client({ telemetry: "verified" });
+    const err = (await f(`${mock.base}/data`).catch((e: unknown) => e)) as PaymentRefusedError;
+    expect(err.code).toBe("refused_verdict");
+    expect(err.receipt).toMatchObject({ proof: null, verification_url: null, reported_outcome: "refused_verdict" });
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+    expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "refused_verdict", amount_usdc: "0.000000" });
+    expect(mock.st.telemetry[0]).not.toHaveProperty("proof");
+  });
+
+  it("paid but no response: proof with no tx hash and no body hash", async () => {
+    mock.st.mode = "hang";
+    const err = (await client({ telemetry: "verified" })(`${mock.base}/data`, { signal: AbortSignal.timeout(500) }).catch((e: unknown) => e)) as SafeFetchError;
+    expect(err.code).toBe("paid_no_response");
+    expect(err.receipt?.proof).toMatchObject({ tx_hash: null, response_sha256: null, payer: account.address.toLowerCase() });
+    await settle();
+    expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "paid_no_response", proof: { tx_hash: null } });
+  });
+
+  it('"anonymous" still sends v1 with no proof; the receipt keeps the proof locally', async () => {
+    const res = await client({ telemetry: "anonymous" })(`${mock.base}/data`);
+    expect(res.receipt.proof).not.toBeNull();
+    expect(res.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry[0]).toMatchObject({ v: 1, outcome: "ok" });
+    expect(mock.st.telemetry[0]).not.toHaveProperty("proof");
+    expect(JSON.stringify(mock.st.telemetry[0])).not.toContain(account.address.slice(2).toLowerCase());
+  });
+
+  it("prints the privacy notice once per receipts directory", async () => {
+    client({ telemetry: "verified" });
+    await settle();
+    expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
+    client({ telemetry: "verified" });
+    await settle();
+    expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
+    client({ telemetry: "anonymous" });
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('refuses a plain-http remote indexUrl with "verified", allows loopback and https', () => {
+    expect(() => client({ telemetry: "verified", indexUrl: "http://paidfor.dev/v1" })).toThrow(/needs an https indexUrl/);
+    expect(() => client({ telemetry: "verified", indexUrl: "http://localhost:9/v1" })).not.toThrow();
+    expect(() => client({ telemetry: "verified", indexUrl: "https://paidfor.dev/v1" })).not.toThrow();
+    expect(() => client({ telemetry: "anonymous", indexUrl: "http://paidfor.dev/v1" })).not.toThrow();
+  });
+
+  it("never follows a redirect on the telemetry POST", async () => {
+    const seen: RequestInit[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/telemetry")) seen.push(init ?? {});
+      return globalThis.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    await client({ telemetry: "verified", fetch: fetchImpl })(`${mock.base}/data`);
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.redirect).toBe("error");
   });
 });

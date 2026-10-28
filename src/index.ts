@@ -4,4 +4,5 @@ export type { Receipt, Outcome } from "./receipt.js";
 export type { Verdict, IndexCheck } from "./index-client.js";
 export type { ValidatorName } from "./taxonomy.js";
 export type { ValidatorResult } from "./validators/types.js";
-export type { TelemetryPayload } from "./telemetry.js";
+export type { TelemetryPayload, TelemetryPayloadV2 } from "./telemetry.js";
+export type { TelemetryProof, TelemetryOutcome } from "./proof.js";

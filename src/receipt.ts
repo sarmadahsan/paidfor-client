@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { writeJsonDurable } from "./fsutil.js";
 import type { Verdict } from "./index-client.js";
 import type { ReferenceSource } from "./price.js";
+import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import type { ValidatorName } from "./taxonomy.js";
 import type { SettlementResponse } from "./x402/types.js";
 import type { ValidatorResult } from "./validators/types.js";
@@ -60,7 +61,25 @@ export interface Receipt {
   settlement: { header: string | null; version: 1 | 2 | null; parsed: SettlementResponse | null; parse_error: string | null };
   tx_hash: string | null;
   nonce: string | null;
-  response: { status: number; content_type: string | null; bytes_inspected: number; body_truncated_for_validation: boolean } | null;
+  /** authorization.from of the signed payment, lowercase. */
+  payer: string | null;
+  /** Proof of payment for a sent authorization (the `proof` of a v2 telemetry row). Null when nothing was sent. */
+  proof: TelemetryProof | null;
+  /** The outcome under the harness names, as a v2 telemetry row reports it. */
+  reported_outcome: TelemetryOutcome | null;
+  /**
+   * {indexUrl}/telemetry/<payer>/<nonce>: whether the index verified this purchase on-chain. Set only when
+   * telemetry is "verified" and a proof was sent.
+   */
+  verification_url: string | null;
+  response: {
+    status: number;
+    content_type: string | null;
+    bytes_inspected: number;
+    body_truncated_for_validation: boolean;
+    /** sha256 hex of the response body; null when it was longer than the validator cap and not fully read. */
+    sha256: string | null;
+  } | null;
   error: { code: string; message: string } | null;
 }
 

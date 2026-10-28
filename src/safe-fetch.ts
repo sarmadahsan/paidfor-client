@@ -9,7 +9,7 @@
  * so wrapFetchWithPayment never re-signs.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { x402Client, type PaymentPolicy } from "@x402/core/client";
 import type { ClientEvmSigner } from "@x402/evm";
@@ -20,9 +20,10 @@ import { IntentIndeterminateError, PaymentRefusedError, SafeFetchError, type Saf
 import { checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
+import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
 import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
-import { CLIENT_ID, buildPayload, sendTelemetry } from "./telemetry.js";
+import { CLIENT_ID, buildPayload, buildPayloadV2, sendTelemetry } from "./telemetry.js";
 import { runAllValidators, validatorsByName } from "./validators/index.js";
 import type { RequestRecord } from "./validators/types.js";
 import { buildResponseRecord, headersToRecord } from "./x402/http.js";
@@ -53,8 +54,11 @@ export interface SafeFetchOptions {
   indexUrl?: string | false;
   /** Validators to run on paid responses. Default: all four. */
   validators?: ValidatorName[];
-  /** Default "off". "anonymous" posts the outcome-only payload in docs/telemetry.md. */
-  telemetry?: "anonymous" | "off";
+  /**
+   * Default "off". "anonymous" posts the outcome-only v1 payload in docs/telemetry.md. "verified" posts the v2
+   * payload: the same fields plus a proof of payment (payer, nonce, pay-to, tx hash) the index checks on Base.
+   */
+  telemetry?: "anonymous" | "verified" | "off";
   /** Receipts, intents, price book and debug log. Default "./.x402-receipts" (resolved once, at creation). */
   receiptsDir?: string;
   /** Default Base mainnet. Only USDC on this network is paid. */
@@ -136,11 +140,22 @@ function wrapResponse(status: number, statusText: string, headers: HeadersInit, 
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
+/** Verified rows carry the payer and nonce, so they only go over https, or to this machine. */
+function isSecureOrLoopback(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFetch {
   if (!options || typeof options.maxPerCallUsd !== "number" || !(options.maxPerCallUsd > 0)) {
     throw new TypeError("safeFetch: options.maxPerCallUsd must be a positive number");
   }
-  const maxRatio = options.maxOverListedRatio ?? 1.1;
+  const maxRatio = options.maxOverListedRatio ?? DEFAULT_MAX_RATIO;
   if (!(Number.isFinite(maxRatio) && maxRatio > 0)) throw new TypeError("safeFetch: maxOverListedRatio must be a positive number");
   const network: SafeNetwork = options.network ?? "eip155:8453";
   const usdc = USDC_BY_NETWORK[network];
@@ -149,7 +164,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const indexUrl = options.indexUrl === false ? undefined : (options.indexUrl ?? "https://paidfor.dev/v1").replace(/\/$/, "");
   const refuseVerdicts = new Set<Verdict>(options.refuseVerdicts ?? ["avoid"]);
   const validators = validatorsByName(options.validators ?? [...ALL_VALIDATORS]);
-  const telemetryOn = options.telemetry === "anonymous" && indexUrl !== undefined;
+  if (options.telemetry === "verified" && indexUrl !== undefined && !isSecureOrLoopback(indexUrl)) {
+    throw new TypeError(`safeFetch: telemetry "verified" needs an https indexUrl (or a loopback one for local testing), got ${indexUrl}`);
+  }
+  const telemetry = indexUrl !== undefined && (options.telemetry === "anonymous" || options.telemetry === "verified") ? options.telemetry : "off";
   const receiptsDir = resolve(options.receiptsDir ?? "./.x402-receipts");
   const baseFetch = options.fetch ?? globalThis.fetch;
   const indexTimeoutMs = options.indexTimeoutMs ?? 2000;
@@ -166,6 +184,31 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     }
   };
 
+  if (telemetry === "verified") void verifiedNotice();
+
+  /** Once per receipts directory: say what verified telemetry sends and where it is documented. */
+  async function verifiedNotice() {
+    const marker = join(receiptsDir, ".verified-telemetry-notice");
+    try {
+      await access(marker);
+      return;
+    } catch {
+      /* first run */
+    }
+    warn(
+      'telemetry: "verified" sends each purchase outcome with its proof of payment (payer address, nonce, pay-to, tx hash) ' +
+        `to ${indexUrl}/telemetry so the index can check it on Base. No bodies, request parameters, IP or identity. ` +
+        'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why ' +
+        '(set telemetry: "anonymous" or "off" to change it). Shown once.',
+    );
+    try {
+      await mkdir(receiptsDir, { recursive: true });
+      await writeFile(marker, `${new Date().toISOString()}\n`);
+    } catch {
+      /* shown again next run; harmless */
+    }
+  }
+
   /** Write the receipt; a local disk failure after paying must not hide the response from the caller. */
   async function persistReceipt(r: Receipt): Promise<string | null> {
     try {
@@ -177,15 +220,54 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   }
 
   function emitTelemetry(r: Receipt) {
-    if (!telemetryOn || !indexUrl) return;
+    if (telemetry === "off" || !indexUrl) return;
     try {
-      void sendTelemetry(
-        indexUrl,
-        buildPayload({ url: r.url, outcome: r.outcome, amountUsdc: r.amount_usdc, latencyMs: r.latency_ms, validatorFailures: r.validator_failures }),
-        { receiptsDir, fetchImpl: baseFetch },
-      );
+      const payload =
+        telemetry === "verified"
+          ? buildPayloadV2({
+              url: r.url,
+              outcome: r.reported_outcome ?? "error",
+              amountUsdc: r.amount_usdc,
+              latencyMs: r.latency_ms,
+              validatorFailures: failureLabels(r.validator_failures, r.response?.status),
+              proof: r.proof,
+            })
+          : buildPayload({ url: r.url, outcome: r.outcome, amountUsdc: r.amount_usdc, latencyMs: r.latency_ms, validatorFailures: r.validator_failures });
+      void sendTelemetry(indexUrl, payload, { receiptsDir, fetchImpl: baseFetch });
     } catch {
       /* never on the purchase path */
+    }
+  }
+
+  /**
+   * Fill proof, reported_outcome and verification_url once the outcome is final. Proof only for a sent
+   * authorization; a refused outcome never carries one.
+   */
+  function attachProof(r: Receipt, settledAt: number | undefined, settlement: ReturnType<typeof decodeSettlementHeader>) {
+    const refAtomic = r.reference ? usdcStringToAtomic(r.reference.amount_usdc) : undefined;
+    r.reported_outcome = harnessOutcome({
+      outcome: r.outcome,
+      ...(r.response ? { status: r.response.status } : {}),
+      validatorFailures: r.validator_failures,
+      settlementSuccess: settlement.parsed ? settlement.parsed.success : null,
+      ...(r.quote ? { amountAtomic: BigInt(r.quote.amount_atomic) } : {}),
+      ...(refAtomic !== undefined ? { referenceAtomic: refAtomic } : {}),
+    });
+    if (!r.paid || REFUSED_OUTCOMES.has(r.reported_outcome) || !r.quote || !r.payer || !r.nonce || settledAt === undefined) return;
+    r.proof = buildProof({
+      network,
+      scheme: r.quote.scheme,
+      asset: r.quote.asset,
+      payTo: r.quote.pay_to,
+      payer: r.payer,
+      nonce: r.nonce,
+      settlement,
+      settledAt,
+      responseSha256: r.response?.sha256 ?? null,
+      declaredTimeoutS: r.quote.max_timeout_seconds,
+    });
+    if (r.proof && telemetry === "verified" && indexUrl) {
+      r.verification_url = `${indexUrl}/telemetry/${r.proof.payer}/${r.proof.nonce}`;
     }
   }
 
@@ -222,6 +304,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       settlement: { header: null, version: null, parsed: null, parse_error: null },
       tx_hash: null,
       nonce: null,
+      payer: null,
+      proof: null,
+      reported_outcome: null,
+      verification_url: null,
       response: null,
       error: null,
     };
@@ -257,6 +343,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       r.validator_failures = original.validator_failures;
       r.tx_hash = original.tx_hash;
       r.nonce = original.nonce;
+      r.payer = original.payer ?? null;
+      r.proof = original.proof ?? null;
+      r.reported_outcome = original.reported_outcome ?? null;
+      r.verification_url = original.verification_url ?? null;
       r.settlement = original.settlement;
       r.response = original.response;
     }
@@ -415,6 +505,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         throw new Error(failure.message);
       }
       r.nonce = String(a.nonce);
+      r.payer = String(a.from).toLowerCase();
       r.amount_usdc = atomicToUsdc(BigInt(value));
       try {
         await lease.update({ phase: "signed", nonce: r.nonce, amount_atomic: value, pay_to: to });
@@ -474,6 +565,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       if (refusal) {
         finish(r, t0, refusal.code);
         r.error = { code: refusal.code, message: refusal.message };
+        attachProof(r, undefined, {});
         await lease.update({ phase: "refused" }).catch(() => undefined);
         await persistReceipt(r);
         emitTelemetry(r);
@@ -485,6 +577,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         finish(r, t0, "paid_no_response");
         const message = `x402-safe-fetch: payment for ${req.url} was signed (nonce ${r.nonce})${sent ? " and sent" : ""}, but no response came back: ${errMsg(e)}. Retrying intent ${r.intent_id} will not sign again.`;
         r.error = { code: "paid_no_response", message };
+        attachProof(r, paidStart, {});
         await persistReceipt(r);
         emitTelemetry(r);
         throw new SafeFetchError("paid_no_response", message, r, { cause: e });
@@ -505,6 +598,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       }
       finish(r, t0, code === "no_acceptable_quote" ? "no_acceptable_quote" : "error");
       r.error = { code, message };
+      attachProof(r, undefined, {});
       await lease.update({ phase: "failed_unpaid" }).catch(() => undefined);
       await persistReceipt(r);
       if (quoteResult) emitTelemetry(r);
@@ -531,7 +625,13 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     );
     r.validators = results;
     r.validator_failures = (Object.entries(results) as [ValidatorName, { status: string }][]).filter(([, v]) => v.status === "fail").map(([k]) => k);
-    r.response = { status: res.status, content_type: res.headers.get("content-type"), bytes_inspected: record.body.length, body_truncated_for_validation: read.truncatedByUs };
+    r.response = {
+      status: res.status,
+      content_type: res.headers.get("content-type"),
+      bytes_inspected: record.body.length,
+      body_truncated_for_validation: read.truncatedByUs,
+      sha256: read.truncatedByUs ? null : sha256(record.body),
+    };
 
     if (paidCount === 0) {
       // Free resource: no 402, nothing signed.
@@ -548,6 +648,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     const tx = st.parsed?.transaction;
     r.tx_hash = typeof tx === "string" && TX_HASH_RE.test(tx) ? tx : null;
     finish(r, t0, r.validator_failures.length ? "validator_failed" : "ok");
+    attachProof(r, paidHeadersAt ?? Date.now(), st);
 
     const receiptFile = await persistReceipt(r);
     const stored: StoredResponse = {
