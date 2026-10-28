@@ -1,0 +1,39 @@
+{
+  "name": "@paidfor/x402-safe-fetch",
+  "version": "0.1.0",
+  "description": "Drop-in wrapper around @x402/fetch that refuses overpriced quotes and bad sellers, never pays twice for one intent, and checks what it bought.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sarmad Siddiki",
+  "homepage": "https://paidfor.dev",
+  "keywords": ["x402", "fetch", "payments", "usdc", "base", "idempotency", "agents"],
+  "engines": { "node": ">=20.3" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE", "docs"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build && pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@x402/core": "~2.28.0",
+    "@x402/evm": "~2.28.0",
+    "@x402/fetch": "~2.28.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0",
+    "viem": "^2.48.11",
+    "vitest": "^5.0.5"
+  },
+  "packageManager": "pnpm@10.34.8"
+}

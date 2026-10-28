@@ -1,0 +1,25 @@
+{
+  "input": "https://api.vapinetwork.ai/shim/o1/token",
+  "host": "api.vapinetwork.ai",
+  "verdict": "avoid",
+  "verdict_text": "Avoid: 100% of 49 paid calls to api.vapinetwork.ai failed the buyer; 49 paid with nothing delivered. Evidence: https://paidfor.dev/seller/api.vapinetwork.ai#evidence",
+  "seller": {
+    "domain": "api.vapinetwork.ai", "tier": "tail", "category": "ai", "calls": 49, "failures": 49, "failure_rate": 1,
+    "wilson_low": 0.9273021797160157, "wilson_high": 1,
+    "by_type": { "non_delivery": 49, "overcharge": 0, "duplicate": 0, "wrong_goods": 0 },
+    "dollar_weighted_rate": 1, "median_quote_usdc": "0.002000", "last_seen": "2026-10-27T12:00:00Z",
+    "inflow_30d_usdc": null, "bazaar_listing_count": 1, "low_sample": false, "verdict": "avoid",
+    "url": "https://paidfor.dev/seller/api.vapinetwork.ai", "evidence_url": "https://paidfor.dev/seller/api.vapinetwork.ai#evidence"
+  },
+  "resource": {
+    "url": "https://api.vapinetwork.ai/shim/o1/token", "method": "POST", "listed_price_usdc": "0.002000",
+    "modal_quote_usdc": "0.002000", "max_quote_usdc": "0.002000", "overcharge_ratio": 1, "calls": 49, "failures": 49,
+    "failure_rate": 1, "wilson_low": 0.9273021797160157, "wilson_high": 1,
+    "by_type": { "non_delivery": 49, "overcharge": 0, "duplicate": 0, "wrong_goods": 0 }
+  },
+  "probe": null,
+  "seller_url": "https://paidfor.dev/seller/api.vapinetwork.ai",
+  "evidence_url": "https://paidfor.dev/seller/api.vapinetwork.ai#evidence",
+  "methodology_url": "https://paidfor.dev/methodology",
+  "generated_at": "2026-10-27T12:00:00Z"
+}

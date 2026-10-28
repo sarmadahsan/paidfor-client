@@ -1,0 +1,586 @@
+/**
+ * safeFetch: @x402/fetch with buyer protection before and after paying.
+ *
+ * The payment plumbing is x402-audit src/x402/pay.ts: a fresh x402Client per call, checks in
+ * onBeforePaymentCreation (runs before the scheme signs; `{ abort: true }` throws before any signature),
+ * hard assertions plus a durable ledger write in onAfterPaymentCreation (runs after signing, before the paid
+ * request is sent), and an inner fetch that sends at most one paid request and never follows a redirect
+ * with a payment header attached. No onPaymentResponse / onPaymentCreationFailure hooks are registered,
+ * so wrapFetchWithPayment never re-signs.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { x402Client, type PaymentPolicy } from "@x402/core/client";
+import type { ClientEvmSigner } from "@x402/evm";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { wrapFetchWithPayment } from "@x402/fetch";
+import { readBodyTee } from "./body.js";
+import { IntentIndeterminateError, PaymentRefusedError, SafeFetchError, type SafeFetchErrorCode } from "./errors.js";
+import { checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
+import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
+import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
+import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
+import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
+import { CLIENT_ID, buildPayload, sendTelemetry } from "./telemetry.js";
+import { runAllValidators, validatorsByName } from "./validators/index.js";
+import type { RequestRecord } from "./validators/types.js";
+import { buildResponseRecord, headersToRecord } from "./x402/http.js";
+import { quoteFromResponse, type QuoteResult } from "./x402/quote.js";
+import { decodeSettlementHeader } from "./x402/settlement.js";
+import {
+  HEADERS,
+  PaymentRequirementsSchema,
+  PaymentRequirementsV1Schema,
+  ResourceInfoSchema,
+  caip2Network,
+  errMsg,
+  normalizeV1,
+  normalizeV2,
+  type NormalizedRequirements,
+} from "./x402/types.js";
+
+export type SafeNetwork = "eip155:8453" | "eip155:84532";
+
+export interface SafeFetchOptions {
+  /** Hard cap per call, in USD (USDC). Required. */
+  maxPerCallUsd: number;
+  /** Refuse quotes above reference * ratio. Default 1.1. */
+  maxOverListedRatio?: number;
+  /** Seller verdicts that block payment. Default ["avoid"]. "caution" is logged when not listed here. */
+  refuseVerdicts?: Exclude<Verdict, "unknown">[];
+  /** paidfor index base URL. Default "https://paidfor.dev/v1". `false` skips the index entirely. */
+  indexUrl?: string | false;
+  /** Validators to run on paid responses. Default: all four. */
+  validators?: ValidatorName[];
+  /** Default "off". "anonymous" posts the outcome-only payload in docs/telemetry.md. */
+  telemetry?: "anonymous" | "off";
+  /** Receipts, intents, price book and debug log. Default "./.x402-receipts" (resolved once, at creation). */
+  receiptsDir?: string;
+  /** Default Base mainnet. Only USDC on this network is paid. */
+  network?: SafeNetwork;
+  /** Underlying fetch (seller, index and telemetry). Default globalThis.fetch. */
+  fetch?: typeof globalThis.fetch;
+  /** Index lookup timeout. Default 2000 ms. */
+  indexTimeoutMs?: number;
+  /** Where "caution" verdicts and non-fatal local write failures are reported. Default console. */
+  logger?: { warn(msg: string): void };
+}
+
+export interface CallOptions {
+  /** Same intentId + same request: returns the stored result, never signs again. Same intentId + different request: throws. */
+  intentId?: string;
+}
+
+export type SafeResponse = Response & { readonly receipt: Receipt };
+export type SafeFetch = (input: string | URL | Request, init?: RequestInit, call?: CallOptions) => Promise<SafeResponse>;
+
+/** A viem LocalAccount / ClientEvmSigner, or a viem WalletClient with an account attached. */
+export type WalletLike =
+  | ClientEvmSigner
+  | {
+      account: { address: `0x${string}` } | undefined;
+      signTypedData(args: { account: unknown; domain: Record<string, unknown>; types: Record<string, unknown>; primaryType: string; message: Record<string, unknown> }): Promise<`0x${string}`>;
+    };
+
+function toSigner(w: WalletLike): ClientEvmSigner {
+  if (w && typeof (w as ClientEvmSigner).address === "string" && typeof w.signTypedData === "function") return w as ClientEvmSigner;
+  const wc = w as Extract<WalletLike, { account: unknown }>;
+  if (wc && wc.account && typeof wc.account.address === "string" && typeof wc.signTypedData === "function") {
+    const account = wc.account;
+    return { address: account.address, signTypedData: (m) => wc.signTypedData({ account, ...m }) };
+  }
+  throw new TypeError("safeFetch: expected a viem account (address + signTypedData) or a WalletClient with an account");
+}
+
+interface NormalizedRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: Uint8Array | undefined;
+  signal: AbortSignal | undefined;
+}
+
+async function normalizeRequest(input: string | URL | Request, init: RequestInit): Promise<NormalizedRequest> {
+  const req = new Request(input, init);
+  const method = req.method.toUpperCase();
+  let body: Uint8Array | undefined;
+  if (method !== "GET" && method !== "HEAD") {
+    const b = new Uint8Array(await req.arrayBuffer());
+    if (b.byteLength > 0) body = b;
+  }
+  return {
+    url: req.url,
+    method,
+    headers: headersToRecord(req.headers),
+    body,
+    signal: init.signal ?? (input instanceof Request ? input.signal : undefined),
+  };
+}
+
+const sha256 = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
+
+/** Request identity for idempotency: method, full URL (query included) and body bytes. Headers are not part of it. */
+export function hashRequest(r: { method: string; url: string; body?: Uint8Array | undefined }): string {
+  return sha256(JSON.stringify([r.method.toUpperCase(), r.url, r.body ? sha256(r.body) : ""]));
+}
+
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+function wrapResponse(status: number, statusText: string, headers: HeadersInit, body: Uint8Array | ReadableStream<Uint8Array> | null, url: string, receipt: Receipt): SafeResponse {
+  const res = new Response(NULL_BODY.has(status) ? null : (body as BodyInit | null), { status, statusText, headers });
+  Object.defineProperty(res, "url", { value: url });
+  Object.defineProperty(res, "receipt", { value: receipt, enumerable: true });
+  return res as SafeResponse;
+}
+
+const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+
+export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFetch {
+  if (!options || typeof options.maxPerCallUsd !== "number" || !(options.maxPerCallUsd > 0)) {
+    throw new TypeError("safeFetch: options.maxPerCallUsd must be a positive number");
+  }
+  const maxRatio = options.maxOverListedRatio ?? 1.1;
+  if (!(Number.isFinite(maxRatio) && maxRatio > 0)) throw new TypeError("safeFetch: maxOverListedRatio must be a positive number");
+  const network: SafeNetwork = options.network ?? "eip155:8453";
+  const usdc = USDC_BY_NETWORK[network];
+  if (!usdc) throw new TypeError(`safeFetch: unsupported network ${network}`);
+  const signer = toSigner(wallet);
+  const indexUrl = options.indexUrl === false ? undefined : (options.indexUrl ?? "https://paidfor.dev/v1").replace(/\/$/, "");
+  const refuseVerdicts = new Set<Verdict>(options.refuseVerdicts ?? ["avoid"]);
+  const validators = validatorsByName(options.validators ?? [...ALL_VALIDATORS]);
+  const telemetryOn = options.telemetry === "anonymous" && indexUrl !== undefined;
+  const receiptsDir = resolve(options.receiptsDir ?? "./.x402-receipts");
+  const baseFetch = options.fetch ?? globalThis.fetch;
+  const indexTimeoutMs = options.indexTimeoutMs ?? 2000;
+  const logger = options.logger ?? console;
+  const maxAtomic = usdToAtomic(options.maxPerCallUsd);
+  const intents = new IntentStore(receiptsDir);
+  const prices = new PriceBook(receiptsDir);
+
+  const warn = (msg: string) => {
+    try {
+      logger.warn(`x402-safe-fetch: ${msg}`);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  /** Write the receipt; a local disk failure after paying must not hide the response from the caller. */
+  async function persistReceipt(r: Receipt): Promise<string | null> {
+    try {
+      return await writeReceipt(receiptsDir, r);
+    } catch (e) {
+      warn(`could not write receipt for intent ${r.intent_id}: ${errMsg(e)}`);
+      return null;
+    }
+  }
+
+  function emitTelemetry(r: Receipt) {
+    if (!telemetryOn || !indexUrl) return;
+    try {
+      void sendTelemetry(
+        indexUrl,
+        buildPayload({ url: r.url, outcome: r.outcome, amountUsdc: r.amount_usdc, latencyMs: r.latency_ms, validatorFailures: r.validator_failures }),
+        { receiptsDir, fetchImpl: baseFetch },
+      );
+    } catch {
+      /* never on the purchase path */
+    }
+  }
+
+  function baseReceipt(req: NormalizedRequest, intentId: string, requestHash: string, t0: number): Receipt {
+    let host: string | null = null;
+    try {
+      host = new URL(req.url).hostname.toLowerCase();
+    } catch {
+      /* ignore */
+    }
+    return {
+      v: 1,
+      client: CLIENT_ID,
+      intent_id: intentId,
+      request_hash: requestHash,
+      url: req.url,
+      method: req.method,
+      started_at: new Date(t0).toISOString(),
+      finished_at: "",
+      latency_ms: 0,
+      outcome: "error",
+      paid: false,
+      replayed: false,
+      replay_of: null,
+      original: null,
+      quote: null,
+      amount_usdc: atomicToUsdc(0n),
+      reference: null,
+      seller: { host, verdict: "unknown", verdict_text: null, seller_url: null, evidence_url: null },
+      index: indexUrl ? "unavailable" : "off",
+      index_note: null,
+      validators: {},
+      validator_failures: [],
+      settlement: { header: null, version: null, parsed: null, parse_error: null },
+      tx_hash: null,
+      nonce: null,
+      response: null,
+      error: null,
+    };
+  }
+
+  const finish = (r: Receipt, t0: number, outcome: Outcome) => {
+    r.outcome = outcome;
+    r.finished_at = new Date().toISOString();
+    r.latency_ms = Date.now() - t0;
+  };
+
+  async function replay(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+    const rec = lease.record;
+    const stored = rec.response;
+    if (!stored) {
+      throw new IntentIndeterminateError("intent_indeterminate", `intent ${rec.intent_id} is marked completed but has no stored response; not signing again`);
+    }
+    let original: Receipt | null = null;
+    if (rec.receipt_file) {
+      try {
+        original = JSON.parse(await readFile(join(receiptsDir, rec.receipt_file), "utf8")) as Receipt;
+      } catch {
+        /* receipt file gone: the stored response is still authoritative */
+      }
+    }
+    r.replayed = true;
+    r.replay_of = rec.receipt_file ?? null;
+    r.original = original;
+    if (original) {
+      r.quote = original.quote;
+      r.seller = original.seller;
+      r.validators = original.validators;
+      r.validator_failures = original.validator_failures;
+      r.tx_hash = original.tx_hash;
+      r.nonce = original.nonce;
+      r.settlement = original.settlement;
+      r.response = original.response;
+    }
+    finish(r, t0, "replayed");
+    await persistReceipt(r);
+    const body = Buffer.from(stored.body_base64, "base64");
+    return wrapResponse(stored.status, stored.statusText, stored.headers, body, stored.url || req.url, r);
+  }
+
+  async function live(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+    let quoteResult: QuoteResult | undefined;
+    let indexP: Promise<IndexCheck> | undefined;
+    let idx: IndexCheck | undefined;
+    let quote: NormalizedRequirements | undefined;
+    let approved: bigint | undefined;
+    let refusal: { code: "refused_verdict" | "refused_ratio" | "refused_max_per_call"; message: string; sellerUrl: string | null } | undefined;
+    let failure: { code: SafeFetchErrorCode; message: string } | undefined;
+    let signingStarted = false;
+    let signedRecorded = false;
+    let sent = false;
+    let unpaidCount = 0;
+    let paidCount = 0;
+    let paidStart: number | undefined;
+    let paidHeadersAt: number | undefined;
+
+    const applyIndex = (i: IndexCheck) => {
+      idx = i;
+      r.index = i.available ? "ok" : "unavailable";
+      r.index_note = i.note ?? null;
+      r.seller = { host: i.host, verdict: i.verdict, verdict_text: i.verdict_text, seller_url: i.seller_url, evidence_url: i.evidence_url };
+    };
+
+    const client = new x402Client();
+    client.setSpendControls(false); // this wrapper enforces its own caps
+    const policy: PaymentPolicy = (version, reqs) =>
+      reqs.filter(
+        (q) =>
+          q.scheme === "exact" &&
+          caip2Network({ x402Version: version === 1 ? 1 : 2, network: q.network }) === network &&
+          typeof q.asset === "string" &&
+          q.asset.toLowerCase() === usdc &&
+          ((q.extra?.assetTransferMethod as string | undefined) ?? "eip3009") === "eip3009",
+      );
+    registerExactEvmScheme(client, { signer, networks: [network], policies: [policy] });
+
+    client.onBeforePaymentCreation(async ({ paymentRequired, selectedRequirements }) => {
+      signingStarted = true;
+      let norm: NormalizedRequirements | undefined;
+      if (paymentRequired.x402Version === 2) {
+        const p = PaymentRequirementsSchema.safeParse(selectedRequirements);
+        const res = ResourceInfoSchema.safeParse(paymentRequired.resource);
+        if (p.success) norm = { ...normalizeV2(p.data, { resource: res.success ? res.data : undefined }), raw: selectedRequirements };
+      } else if (paymentRequired.x402Version === 1) {
+        const p = PaymentRequirementsV1Schema.safeParse(selectedRequirements);
+        if (p.success) norm = { ...normalizeV1(p.data), raw: selectedRequirements };
+      }
+      if (!norm || !/^\d+$/.test(norm.amountAtomic)) {
+        failure = { code: "no_acceptable_quote", message: "selected payment requirements failed schema validation" };
+        return { abort: true, reason: failure.message };
+      }
+      if (norm.scheme !== "exact" || caip2Network(norm) !== network || norm.asset.toLowerCase() !== usdc) {
+        failure = { code: "sdk", message: `SDK selected ${norm.scheme}/${norm.network}/${norm.asset}, expected exact/${network}/USDC` };
+        return { abort: true, reason: failure.message };
+      }
+      quote = norm;
+      const amount = BigInt(norm.amountAtomic);
+      r.quote = {
+        x402_version: norm.x402Version,
+        scheme: norm.scheme,
+        network: norm.network,
+        asset: norm.asset,
+        pay_to: norm.payTo,
+        amount_atomic: amount.toString(),
+        amount_usdc: atomicToUsdc(amount),
+        max_timeout_seconds: norm.maxTimeoutSeconds,
+        resource_url: norm.resourceUrl ?? null,
+      };
+      const usd = `${atomicToUsdc(amount)} USDC`;
+      const host = r.seller.host ?? "the seller";
+
+      applyIndex(indexP ? await indexP : { available: false, note: "index not queried", host: r.seller.host, verdict: "unknown", verdict_text: null, seller_url: null, evidence_url: null, listed_price_usdc: null });
+      const i = idx!;
+      const sellerLink = i.seller_url ? ` See ${i.seller_url}` : "";
+
+      // 1. Seller verdict (advisory index; only a reachable index with a known verdict can refuse).
+      if (i.available && refuseVerdicts.has(i.verdict)) {
+        refusal = {
+          code: "refused_verdict",
+          message: `refused to pay ${usd} to ${host}: paidfor.dev rates this seller "${i.verdict}"${i.verdict_text ? ` (${i.verdict_text})` : ""}.${sellerLink}`,
+          sellerUrl: i.seller_url,
+        };
+        return { abort: true, reason: refusal.message };
+      }
+      if (i.available && i.verdict === "caution") {
+        warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
+      }
+
+      // 2. Quote vs reference: index listed price, else the last price this client paid for the resource.
+      let ref: { amount: bigint; source: ReferenceSource } | undefined;
+      const listed = i.available ? usdcStringToAtomic(i.listed_price_usdc) : undefined;
+      if (listed !== undefined) ref = { amount: listed, source: "index_listed" };
+      else {
+        const last = await prices.get(resourceKey(req.method, req.url)).catch(() => undefined);
+        if (last !== undefined) ref = { amount: last, source: "local_last_paid" };
+      }
+      if (ref) {
+        const ratio = quoteRatio(amount, ref.amount);
+        r.reference = { amount_usdc: atomicToUsdc(ref.amount), source: ref.source, ratio, max_ratio: maxRatio };
+        if (exceedsRatio(amount, ref.amount, maxRatio)) {
+          const what = ref.source === "index_listed" ? "the listed price on paidfor.dev" : "the last price this client paid";
+          refusal = {
+            code: "refused_ratio",
+            message: `refused to pay ${usd} for ${req.url}: that is ${ratio.toFixed(2)}x ${what} (${atomicToUsdc(ref.amount)} USDC), above the ${maxRatio}x limit.${sellerLink}`,
+            sellerUrl: i.seller_url,
+          };
+          return { abort: true, reason: refusal.message };
+        }
+      }
+
+      // 3. Per-call cap.
+      if (amount > maxAtomic) {
+        refusal = {
+          code: "refused_max_per_call",
+          message: `refused to pay ${usd} for ${req.url}: above maxPerCallUsd ${atomicToUsdc(maxAtomic)} USDC.${sellerLink}`,
+          sellerUrl: i.seller_url,
+        };
+        return { abort: true, reason: refusal.message };
+      }
+
+      approved = amount;
+      try {
+        await lease.update({ phase: "signing", amount_atomic: amount.toString(), pay_to: norm.payTo });
+      } catch (e) {
+        failure = { code: "sdk", message: `could not record intent before signing: ${errMsg(e)}` };
+        return { abort: true, reason: failure.message };
+      }
+      return undefined;
+    });
+
+    client.onAfterPaymentCreation(async ({ paymentPayload }) => {
+      const p = paymentPayload.payload as { signature?: unknown; authorization?: Record<string, unknown> };
+      const a = p.authorization;
+      if (!a || typeof p.signature !== "string") {
+        failure = { code: "sdk", message: "signed payload has no EIP-3009 authorization/signature" };
+        throw new Error(failure.message);
+      }
+      const value = String(a.value);
+      const to = String(a.to);
+      // Hard assertions before anything leaves the process.
+      if (approved === undefined || !/^\d+$/.test(value) || BigInt(value) > approved) {
+        failure = { code: "sdk", message: `signed value ${value} exceeds the approved amount ${approved}` };
+        throw new Error(failure.message);
+      }
+      if (!quote || to.toLowerCase() !== quote.payTo.toLowerCase()) {
+        failure = { code: "sdk", message: `signed to ${to} does not match requirements.payTo ${quote?.payTo}` };
+        throw new Error(failure.message);
+      }
+      r.nonce = String(a.nonce);
+      r.amount_usdc = atomicToUsdc(BigInt(value));
+      try {
+        await lease.update({ phase: "signed", nonce: r.nonce, amount_atomic: value, pay_to: to });
+      } catch (e) {
+        failure = { code: "sdk", message: `could not record signed intent; not sending payment: ${errMsg(e)}` };
+        throw e;
+      }
+      signedRecorded = true;
+    });
+
+    const innerFetch = async (input: string | URL | Request, rinit?: RequestInit): Promise<Response> => {
+      const rq = input instanceof Request ? input : new Request(input, rinit);
+      const isPaid = rq.headers.has(HEADERS.V2_SIGNATURE) || rq.headers.has(HEADERS.V1_PAYMENT);
+      const fInit: RequestInit = { method: rq.method, headers: headersToRecord(rq.headers) };
+      if (rq.method !== "GET" && rq.method !== "HEAD") {
+        const b = new Uint8Array(await rq.arrayBuffer());
+        if (b.byteLength) fInit.body = b as BodyInit;
+      }
+      if (req.signal) fInit.signal = req.signal;
+
+      if (!isPaid) {
+        if (++unpaidCount > 1) throw new Error("x402-safe-fetch: refusing a second unpaid request");
+        fInit.redirect = "follow";
+        const start = Date.now();
+        const res = await baseFetch(rq.url, fInit);
+        if (res.status !== 402) return res;
+        quoteResult = await quoteFromResponse(rq.url, res, start);
+        if (indexUrl) indexP = checkIndex(indexUrl, req.url, { timeoutMs: indexTimeoutMs, fetchImpl: baseFetch });
+        // Hand the wrapper an equivalent 402 (we consumed the original body).
+        return new Response(quoteResult.bodyText ?? "", { status: 402, headers: res.headers });
+      }
+
+      if (++paidCount > 1) throw new Error("x402-safe-fetch: refusing a second paid request (automatic retry is disabled)");
+      if (!signedRecorded) throw new Error("x402-safe-fetch: refusing to send a payment that was not recorded");
+      // Do not follow redirects: a redirect would re-send PAYMENT-SIGNATURE to another URL.
+      fInit.redirect = "manual";
+      paidStart = Date.now();
+      sent = true;
+      const res = await baseFetch(rq.url, fInit);
+      paidHeadersAt = Date.now();
+      return res;
+    };
+
+    const fetchWithPayment = wrapFetchWithPayment(innerFetch as typeof globalThis.fetch, client);
+    const reqInit: RequestInit = { method: req.method, headers: req.headers };
+    if (req.body) reqInit.body = req.body as BodyInit;
+
+    const settleIndex = async () => {
+      if (!idx && indexP) applyIndex(await indexP);
+    };
+
+    let res: Response;
+    try {
+      res = await fetchWithPayment(req.url, reqInit);
+    } catch (e) {
+      await settleIndex();
+      if (refusal) {
+        finish(r, t0, refusal.code);
+        r.error = { code: refusal.code, message: refusal.message };
+        await lease.update({ phase: "refused" }).catch(() => undefined);
+        await persistReceipt(r);
+        emitTelemetry(r);
+        throw new PaymentRefusedError(refusal.code, `x402-safe-fetch ${refusal.message}`, refusal.sellerUrl, r);
+      }
+      if (signedRecorded) {
+        // The authorization exists and may be with the seller. The intent stays "signed": never re-signed.
+        r.paid = sent;
+        finish(r, t0, "paid_no_response");
+        const message = `x402-safe-fetch: payment for ${req.url} was signed (nonce ${r.nonce})${sent ? " and sent" : ""}, but no response came back: ${errMsg(e)}. Retrying intent ${r.intent_id} will not sign again.`;
+        r.error = { code: "paid_no_response", message };
+        await persistReceipt(r);
+        emitTelemetry(r);
+        throw new SafeFetchError("paid_no_response", message, r, { cause: e });
+      }
+      let code: SafeFetchErrorCode;
+      let message: string;
+      if (failure) ({ code, message } = failure);
+      else if (quoteResult && !signingStarted) {
+        code = "no_acceptable_quote";
+        const offered = (quoteResult.parsed?.accepts ?? []).map((a) => `${a.scheme}/${a.network}/${a.asset} ${a.amountAtomic}`).join(", ");
+        message = `seller offered no exact USDC payment on ${network}${offered ? `: ${offered}` : ""}${quoteResult.parsed?.parseError ? ` (${quoteResult.parsed.parseError})` : ""}`;
+      } else if (!quoteResult) {
+        code = "network";
+        message = errMsg(e instanceof Error && e.cause !== undefined ? e.cause : e);
+      } else {
+        code = "sdk";
+        message = errMsg(e);
+      }
+      finish(r, t0, code === "no_acceptable_quote" ? "no_acceptable_quote" : "error");
+      r.error = { code, message };
+      await lease.update({ phase: "failed_unpaid" }).catch(() => undefined);
+      await persistReceipt(r);
+      if (quoteResult) emitTelemetry(r);
+      throw new SafeFetchError(code, `x402-safe-fetch: ${message}`, r, { cause: e });
+    }
+
+    // Response in hand. Read up to MAX_BODY_BYTES for the validators; the caller still gets the full body.
+    const read = await readBodyTee(res, MAX_BODY_BYTES);
+    const startedAt = paidCount > 0 ? (paidStart ?? t0) : t0;
+    const record = buildResponseRecord(res, read, startedAt, paidCount > 0 ? (paidHeadersAt ?? Date.now()) : Date.now(), Date.now());
+    const request: RequestRecord = { url: req.url, method: req.method, headers: req.headers, params: {}, sentAt: startedAt };
+    if (req.body) request.body = Buffer.from(req.body).toString("utf8");
+    const results = await runAllValidators(
+      {
+        request,
+        response: record,
+        requirements: {
+          ...(quote?.mimeType !== undefined ? { mimeType: quote.mimeType } : {}),
+          ...(quote?.maxTimeoutSeconds !== undefined ? { maxTimeoutSeconds: quote.maxTimeoutSeconds } : {}),
+        },
+        now: Date.now(),
+      },
+      validators,
+    );
+    r.validators = results;
+    r.validator_failures = (Object.entries(results) as [ValidatorName, { status: string }][]).filter(([, v]) => v.status === "fail").map(([k]) => k);
+    r.response = { status: res.status, content_type: res.headers.get("content-type"), bytes_inspected: record.body.length, body_truncated_for_validation: read.truncatedByUs };
+
+    if (paidCount === 0) {
+      // Free resource: no 402, nothing signed.
+      await settleIndex();
+      finish(r, t0, "no_payment_required");
+      await lease.update({ phase: "unpaid" }).catch(() => undefined);
+      await persistReceipt(r);
+      return wrapResponse(res.status, res.statusText, res.headers, read.callerBody, res.url || req.url, r);
+    }
+
+    r.paid = true;
+    const st = decodeSettlementHeader(record.headers);
+    r.settlement = { header: st.raw ?? null, version: st.version ?? null, parsed: st.parsed ?? null, parse_error: st.parseError ?? null };
+    const tx = st.parsed?.transaction;
+    r.tx_hash = typeof tx === "string" && TX_HASH_RE.test(tx) ? tx : null;
+    finish(r, t0, r.validator_failures.length ? "validator_failed" : "ok");
+
+    const receiptFile = await persistReceipt(r);
+    const stored: StoredResponse = {
+      url: res.url || req.url,
+      status: res.status,
+      statusText: res.statusText,
+      headers: [...res.headers.entries()],
+      body_base64: Buffer.from(record.body).toString("base64"),
+      body_truncated: read.truncatedByUs,
+    };
+    try {
+      await lease.update({ phase: "completed", response: stored, ...(receiptFile ? { receipt_file: receiptFile } : {}) });
+    } catch (e) {
+      warn(`paid response for intent ${r.intent_id} could not be stored (${errMsg(e)}); a retry with this intentId will refuse rather than pay again`);
+    }
+    if (r.outcome === "ok" && approved !== undefined) {
+      await prices.set(resourceKey(req.method, req.url), approved).catch((e: unknown) => warn(`price book not updated: ${errMsg(e)}`));
+    }
+    emitTelemetry(r);
+    return wrapResponse(res.status, res.statusText, res.headers, read.callerBody, res.url || req.url, r);
+  }
+
+  return async function fetchWithPay(input, init = {}, call = {}) {
+    const t0 = Date.now();
+    const req = await normalizeRequest(input, init);
+    const requestHash = hashRequest(req);
+    const intentId = call.intentId ?? randomUUID();
+    const lease = await intents.acquire(intentId, requestHash);
+    try {
+      const r = baseReceipt(req, intentId, requestHash, t0);
+      return lease.replay ? await replay(lease, req, r, t0) : await live(lease, req, r, t0);
+    } finally {
+      await lease.release();
+    }
+  };
+}

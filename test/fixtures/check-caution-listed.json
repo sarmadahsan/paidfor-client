@@ -1,0 +1,13 @@
+{
+  "input": "https://odds.rjhsignaltech.workers.dev/v1/balance",
+  "host": "odds.rjhsignaltech.workers.dev",
+  "verdict": "caution",
+  "verdict_text": "Caution: only 33 paid calls; 33 overcharged. Evidence: https://paidfor.dev/seller/odds.rjhsignaltech.workers.dev#evidence",
+  "seller": { "domain": "odds.rjhsignaltech.workers.dev", "verdict": "caution", "url": "https://paidfor.dev/seller/odds.rjhsignaltech.workers.dev" },
+  "resource": { "url": "https://odds.rjhsignaltech.workers.dev/v1/balance", "method": "GET", "listed_price_usdc": "0.001000", "modal_quote_usdc": "0.002000" },
+  "probe": null,
+  "seller_url": "https://paidfor.dev/seller/odds.rjhsignaltech.workers.dev",
+  "evidence_url": "https://paidfor.dev/seller/odds.rjhsignaltech.workers.dev#evidence",
+  "methodology_url": "https://paidfor.dev/methodology",
+  "generated_at": "2026-10-27T12:00:00Z"
+}

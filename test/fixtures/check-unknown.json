@@ -1,0 +1,13 @@
+{
+  "input": "https://never-seen.example.com/api",
+  "host": "never-seen.example.com",
+  "verdict": "unknown",
+  "verdict_text": "Unknown: never-seen.example.com was never seen in the study or in the hourly probe set. Methodology: https://paidfor.dev/methodology",
+  "seller": null,
+  "resource": null,
+  "probe": null,
+  "seller_url": null,
+  "evidence_url": null,
+  "methodology_url": "https://paidfor.dev/methodology",
+  "generated_at": "2026-10-27T12:00:00Z"
+}
