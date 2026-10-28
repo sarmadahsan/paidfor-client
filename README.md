@@ -2,7 +2,8 @@
 
 A drop-in wrapper around the official [`@x402/fetch`](https://www.npmjs.com/package/@x402/fetch) client (2.28.x)
 that protects the buyer before and after paying. It refuses overpriced quotes and sellers rated "avoid", never
-pays twice for the same intent, and checks what it bought.
+pays twice for the same intent, and checks what it bought. No account, no key, nothing to sign up for: not to
+install it, not to read the index, and not to contribute telemetry.
 
 This is the client-side half of the x402 seller index at [paidfor.dev](https://paidfor.dev).
 
@@ -19,7 +20,7 @@ const fetchWithPay = safeFetch(walletClient, {
   refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed but logged
   indexUrl: "https://paidfor.dev/v1",
   validators: ["http_status", "non_empty", "content_type", "not_truncated"],
-  telemetry: "anonymous",      // or "off" (the default)
+  telemetry: "verified",       // or "anonymous" (no proof of payment) or "off" (the default)
   receiptsDir: "./.x402-receipts",
 });
 
@@ -48,7 +49,7 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
    id, quote, amount, reference price and its source, seller verdict, validator results, the settlement header,
    and the on-chain tx hash when the header carries it. The same receipt is written to the receipts directory as
    one JSON file per call.
-4. **Telemetry, when enabled.** One outcome-only POST, fire-and-forget. See below.
+4. **Telemetry, when enabled.** One POST per call, fire-and-forget. See below.
 
 ## What it blocks and what it does not
 
@@ -71,22 +72,93 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
   intents/<sha256(intentId)>.json        idempotency state and the stored response
   prices.json                            last price paid per resource (method + origin + path)
   debug.log                              telemetry failures, local only
+  .verified-telemetry-notice             marks that the one-time "verified" notice was shown
 ```
+
+Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, with
+`telemetry: "verified"`, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, where you can
+later see whether the index verified your row on-chain. **That route is not live yet: until the index ships it,
+the URL answers 404.** `reported_outcome` is the outcome under the harness names, as the row reports it.
 
 Keep this directory if you want the idempotency guarantee to survive restarts.
 
 ## Telemetry
 
-Off by default. With `telemetry: "anonymous"`, each call that got a 402 posts exactly this to
-`{indexUrl}/telemetry`, with a 1-second timeout, never awaited, every failure swallowed:
+Three settings. Every one is fire-and-forget: a 1-second timeout, never awaited, every failure swallowed and
+only counted in `debug.log`. Nothing is sent for free resources (no 402) or for replays of a stored intent.
+
+| `telemetry` | Sends |
+| --- | --- |
+| `"off"` (default) | Nothing. |
+| `"anonymous"` | A v1 row: the outcome, amount, latency and validator names. No wallet address, no proof. |
+| `"verified"` | A v2 row: the same fields with the outcome under the index's names, plus a proof of payment the index checks on Base. |
+
+v1 row:
 
 ```json
 { "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.1.0" }
+  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.0" }
 ```
 
-No bodies, no wallet address, no request parameters, no intent id. The field list and the privacy promise are in
-[docs/telemetry.md](docs/telemetry.md).
+Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
+
+## What verified telemetry sends and why
+
+paidfor.dev measures sellers with its own wallet, which cannot cover the whole market. With
+`telemetry: "verified"`, each of your purchases becomes a data point the index can trust, because it can prove
+on-chain that you actually paid: it looks up the `AuthorizationUsed(payer, nonce)` event and the matching USDC
+`Transfer` on Base. Rows that do not verify are stored but never counted.
+
+> **Status:** the index verifies v2 rows starting with its next release. Until then it accepts only v1 rows, so a
+> verified row is answered with a 400, which the client swallows and counts in `debug.log`, and
+> `verification_url` answers 404. Nothing about your purchase changes.
+
+This is the whole message, for a paid call that got a 500:
+
+```json
+{
+  "v": 2,
+  "host": "api.example.com",
+  "path_hash": "<sha256 hex of the URL path without trailing slash>",
+  "outcome": "non_delivery",
+  "amount_usdc": "0.002000",
+  "latency_ms": 1840,
+  "validator_failures": ["http_status:500"],
+  "client": "x402-safe-fetch/0.2.0",
+  "proof": {
+    "network": "eip155:8453",
+    "scheme": "exact",
+    "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "pay_to": "<seller pay-to address, lowercase>",
+    "payer": "<your wallet address, lowercase>",
+    "nonce": "<32-byte EIP-3009 authorization nonce>",
+    "tx_hash": "<settlement transaction hash, or null if the seller's header had none>",
+    "settled_at": "2026-10-29T10:12:03.000Z",
+    "response_sha256": "<sha256 hex of the response body, or null>",
+    "declared_timeout_s": 60
+  }
+}
+```
+
+- **The payer address adds no new exposure.** Every settled x402 payment is a public USDC transfer from your
+  address to the seller's, with this nonce, on Base. Anyone can already read it from the chain; the row only
+  attaches the outcome you observed.
+- **Keyless ingest.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores no IP
+  address or identity with the row.
+- **Bodies and request parameters never leave your machine.** The path is hashed, the query string is dropped
+  before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
+  validator evidence are never sent.
+- **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
+  refusal, never in a failure rate.
+- **Outcomes use the index's names:** `ok`, `non_delivery` (a delivery validator failed after paying),
+  `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
+  `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
+  `error`.
+- **Turning it off.** `telemetry: "anonymous"` sends the v1 row without any address; `telemetry: "off"` (the
+  default) sends nothing. `indexUrl: false` turns off the index lookup and all telemetry.
+
+The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
+here.
 
 ## Errors
 

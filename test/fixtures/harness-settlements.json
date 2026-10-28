@@ -1,0 +1,86 @@
+[
+  {
+    "name": "v1_with_tx",
+    "source": "x402-audit data/audit.sqlite calls row, header stored raw",
+    "x402_version": 1,
+    "header": {
+      "X-PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJlcnJvclJlYXNvbiI6bnVsbCwicGF5ZXIiOiIweGI4M0JFMTlBNmYxNkJCNzY0M0VDRDAxNWFmQmUxNEQ4YTM1Mzc1Q0MiLCJ0cmFuc2FjdGlvbiI6IjB4MzBjMTMyNTBhMWMxMTQxNzQyNWIxNTM4Zjc3MjFlMmVmNTQ3MmE3NjRiMzY3YjI3YjdmYjU2NmU3MWRhYWJiNSIsIm5ldHdvcmsiOiJiYXNlIn0="
+    },
+    "url": "https://api.slamai.dev/chain/tokens/newest",
+    "ts": 1792973572401,
+    "payer": "0xb83BE19A6f16BB7643ECD015afBe14D8a35375CC",
+    "amount_atomic": "1585",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "network": "base",
+    "pay_to": "0xd85096fAeC1aC03075667B4C1a1661F5623Bf111",
+    "nonce": "0x0c07cdb12edb123cacaa71784195e25af0668932735956d3f093f99d6e874652",
+    "response_status": 200,
+    "response_body_sha256": "5ed3fc86e23ac53b3d7c41d980552b3eda92765d299218659fc01ae69b778726",
+    "max_timeout_seconds": 300,
+    "settlement_tx_hash": "0x30c13250a1c11417425b1538f7721e2ef5472a764b367b27b7fb566e71daabb5",
+    "harness_outcome": "ok"
+  },
+  {
+    "name": "v2_with_tx",
+    "source": "x402-audit data/audit.sqlite calls row; the harness stores the decoded v2 header, re-encoded here",
+    "x402_version": 2,
+    "header": {
+      "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJ0cmFuc2FjdGlvbiI6IjB4MTgxYTczNjgyOWE2MDJlZGY1NGVlMDE2MWE5MWI1Y2Q2NjI3N2M5NDAzYzhkYzQwZDdlZDgwN2IyMWU2ZTA1MCIsIm5ldHdvcmsiOiJlaXAxNTU6ODQ1MyIsInBheWVyIjoiMHgyNDY1QTQ4RjFlNDRFRjYwYTk4NjI1N0UwQjdjNmY5MGUwYThhMWIxIn0="
+    },
+    "url": "https://palmyr.ai/social/twitter/post",
+    "ts": 1792973676051,
+    "payer": "0x2465A48F1e44EF60a986257E0B7c6f90e0a8a1b1",
+    "amount_atomic": "1000",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "network": "eip155:8453",
+    "pay_to": "0x79e999e2f9d5417F2803f1d88602aB1EA4323881",
+    "nonce": "0x41d71042623db675baff7e0016ac3c961cb8f22d8a4942e665b60d9497e11f52",
+    "response_status": 400,
+    "response_body_sha256": "2004a472562f5c5854b0cb7dd7ab8b401cd74a33898d9253c21c9cc9dea7ef3a",
+    "max_timeout_seconds": 60,
+    "settlement_tx_hash": "0x181a736829a602edf54ee0161a91b5cd66277c9403c8dc40d7ed807b21e6e050",
+    "harness_outcome": "non_delivery"
+  },
+  {
+    "name": "v2_without_tx",
+    "source": "x402-audit data/audit.sqlite calls row (facilitator settle failed); decoded header re-encoded",
+    "x402_version": 2,
+    "header": {
+      "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjpmYWxzZSwidHJhbnNhY3Rpb24iOiIiLCJuZXR3b3JrIjoiZWlwMTU1Ojg0NTMiLCJlcnJvclJlYXNvbiI6IkZhY2lsaXRhdG9yIHNldHRsZSBmYWlsZWQgKDQwMik6IHtcImNvcnJlbGF0aW9uSWRcIjpcImE1MDQ3OTU4OTg5NWFhMTctSUFEXCIsXCJlcnJvckxpbmtcIjpcImh0dHBzOi8vZG9jcy5jZHAuY29pbmJhc2UuY29tL2FwaS1yZWZlcmVuY2UvdjIvZXJyb3JzI3BheW1lbnQtbWV0aG9kLXJlcXVpcmVkXCIsXCJlcnJvck1lc3NhZ2VcIjpcIkEgdmFsaWQgcGF5bWVudCBtZXRob2QgaXMgcmVxdWlyZWQgdG8gY29tcGxldGUgdGguLi4iLCJlcnJvck1lc3NhZ2UiOiJGYWNpbGl0YXRvciBzZXR0bGUgZmFpbGVkICg0MDIpOiB7XCJjb3JyZWxhdGlvbklkXCI6XCJhNTA0Nzk1ODk4OTVhYTE3LUlBRFwiLFwiZXJyb3JMaW5rXCI6XCJodHRwczovL2RvY3MuY2RwLmNvaW5iYXNlLmNvbS9hcGktcmVmZXJlbmNlL3YyL2Vycm9ycyNwYXltZW50LW1ldGhvZC1yZXF1aXJlZFwiLFwiZXJyb3JNZXNzYWdlXCI6XCJBIHZhbGlkIHBheW1lbnQgbWV0aG9kIGlzIHJlcXVpcmVkIHRvIGNvbXBsZXRlIHRoLi4uIn0="
+    },
+    "url": "https://cars2026.vercel.app/api/cars",
+    "ts": 1792965415139,
+    "payer": "0xE8273A7AEA1A99639801Dbe8767429F0126150A0",
+    "amount_atomic": "1100",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "network": "eip155:8453",
+    "pay_to": "0x1e21dBA6EEb902343E4128a1957eAfB8CDf36f39",
+    "nonce": "0x46e3b72e1061d2141032d78a2c6443e321c838d1f318f775f8ce2b074ec90298",
+    "response_status": 402,
+    "response_body_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "max_timeout_seconds": 300,
+    "settlement_tx_hash": null,
+    "harness_outcome": "not_paid"
+  },
+  {
+    "name": "v1_without_tx",
+    "source": "header from x402-audit src/x402/types.test.ts (no real v1 header in the harness database lacks a tx hash), authorization fields from the v1_with_tx row",
+    "x402_version": 1,
+    "header": {
+      "X-PAYMENT-RESPONSE": "eyJzdWNjZXNzIjpmYWxzZSwidHJhbnNhY3Rpb24iOiIiLCJuZXR3b3JrIjoiYmFzZSIsImVycm9yUmVhc29uIjoiaW5zdWZmaWNpZW50X2Z1bmRzIn0="
+    },
+    "url": "https://api.slamai.dev/chain/tokens/newest",
+    "ts": 1792973572401,
+    "payer": "0xb83BE19A6f16BB7643ECD015afBe14D8a35375CC",
+    "amount_atomic": "1585",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "network": "base",
+    "pay_to": "0xd85096fAeC1aC03075667B4C1a1661F5623Bf111",
+    "nonce": "0x0c07cdb12edb123cacaa71784195e25af0668932735956d3f093f99d6e874652",
+    "response_status": 402,
+    "response_body_sha256": null,
+    "max_timeout_seconds": 300,
+    "settlement_tx_hash": null,
+    "harness_outcome": null
+  }
+]

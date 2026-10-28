@@ -60,6 +60,10 @@ const fetchWithPay = safeFetch(wallet, {
   maxPerCallUsd: 10,
   validators: ["http_status", "non_empty", "content_type", "not_truncated"],
   indexUrl: false, // the example runs offline; leave the default (https://paidfor.dev/v1) in production
+  // Report each outcome with its proof of payment, so paidfor.dev can verify on Base that this paid 500 really
+  // happened and count it against the seller. Sends no bodies or request parameters; the payer address is already
+  // public on-chain. Needs indexUrl (sends nothing here, offline). "anonymous" drops the proof, "off" sends nothing.
+  telemetry: "verified",
   network: "eip155:84532",
   receiptsDir: await mkdtemp(join(tmpdir(), "conway-receipts-")),
 });
@@ -74,7 +78,7 @@ for (let tick = 1; tick <= 5; tick++) {
   const r = res.receipt;
   console.log(
     `tick ${tick}: HTTP ${res.status}  ${r.replayed ? "replayed stored result, nothing signed" : `paid ${r.amount_usdc} USDC, tx ${r.tx_hash}`}` +
-      `  validator failures: ${r.validator_failures.join(", ") || "none"}`,
+      `  validator failures: ${r.validator_failures.join(", ") || "none"}  reported as: ${r.reported_outcome}`,
   );
   if (r.validator_failures.includes("http_status")) {
     // Paid but not delivered: stop retrying the payment and escalate with the receipt (it has the tx hash).

@@ -1,6 +1,6 @@
 {
   "name": "@paidfor/x402-safe-fetch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Drop-in wrapper around @x402/fetch that refuses overpriced quotes and bad sellers, never pays twice for one intent, and checks what it bought.",
   "type": "module",
   "license": "MIT",
@@ -14,7 +14,7 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE", "docs", "examples"],
+  "files": ["dist", "README.md", "CHANGELOG.md", "LICENSE", "docs", "examples"],
   "sideEffects": false,
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",

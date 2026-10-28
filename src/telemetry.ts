@@ -1,13 +1,16 @@
 /**
- * Anonymous outcome telemetry. Exactly the payload in docs/telemetry.md: no bodies, no wallet address,
- * no request parameters, no intent id. Fire-and-forget with a 1 s timeout; failures are only counted
- * in <receiptsDir>/debug.log.
+ * Outcome telemetry. Exactly the payloads in docs/telemetry.md. "anonymous" sends v1: no bodies, no wallet
+ * address, no request parameters, no intent id. "verified" sends v2: the v1 fields with harness outcome names,
+ * plus `proof` (payer, nonce, pay-to, tx hash) for paid calls so the index can check the payment on Base.
+ * Fire-and-forget with a 1 s timeout; failures are only counted in <receiptsDir>/debug.log.
  */
 import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
+import { REFUSED_OUTCOMES } from "./proof.js";
 
-export const CLIENT_ID = "x402-safe-fetch/0.1.0";
+export const CLIENT_ID = "x402-safe-fetch/0.2.0";
 
 export interface TelemetryPayload {
   v: 1;
@@ -39,10 +42,40 @@ export function buildPayload(i: { url: string; outcome: string; amountUsdc: stri
   };
 }
 
+export interface TelemetryPayloadV2 {
+  v: 2;
+  host: string;
+  path_hash: string;
+  outcome: TelemetryOutcome;
+  amount_usdc: string;
+  latency_ms: number;
+  validator_failures: string[];
+  client: typeof CLIENT_ID;
+  /** Present only when an authorization was signed and sent. Never on a refused outcome. */
+  proof?: TelemetryProof;
+}
+
+export function buildPayloadV2(i: {
+  url: string;
+  outcome: TelemetryOutcome;
+  amountUsdc: string;
+  latencyMs: number;
+  validatorFailures: string[];
+  proof: TelemetryProof | null;
+}): TelemetryPayloadV2 {
+  const p: TelemetryPayloadV2 = {
+    ...buildPayload({ ...i, outcome: i.outcome }),
+    v: 2,
+    outcome: i.outcome,
+  };
+  if (i.proof && !REFUSED_OUTCOMES.has(i.outcome)) p.proof = { ...i.proof };
+  return p;
+}
+
 let failures = 0;
 
 /** Never awaited by callers, never throws, never rejects. Returns the promise only so tests can wait on it. */
-export function sendTelemetry(indexUrl: string, payload: TelemetryPayload, o: { receiptsDir: string; fetchImpl?: typeof globalThis.fetch }): Promise<void> {
+export function sendTelemetry(indexUrl: string, payload: TelemetryPayload | TelemetryPayloadV2, o: { receiptsDir: string; fetchImpl?: typeof globalThis.fetch }): Promise<void> {
   const fetchImpl = o.fetchImpl ?? globalThis.fetch;
   const logFailure = async (why: string) => {
     failures++;
