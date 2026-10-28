@@ -93,6 +93,8 @@ export function sendTelemetry(indexUrl: string, payload: TelemetryPayload | Tele
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(1000),
+        // The route answers directly; never let a redirect carry the row somewhere else (or to plain http).
+        redirect: "error",
       });
       res.body?.cancel().catch(() => undefined);
       if (!res.ok) await logFailure(`http ${res.status}`);

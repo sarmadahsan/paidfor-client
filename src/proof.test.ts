@@ -113,6 +113,10 @@ describe("harnessOutcome", () => {
     expect(harnessOutcome(paid({ outcome: "validator_failed", status: v === "http_status" ? 500 : 200, validatorFailures: [v] }))).toBe("non_delivery");
   });
 
+  it("a paid non-2xx is non_delivery even when http_status was not run", () => {
+    expect(harnessOutcome(paid({ outcome: "ok", status: 500, validatorFailures: [] }))).toBe("non_delivery");
+  });
+
   it("a paid 2xx with no settlement header is classified by validators (the index checks the chain)", () => {
     expect(harnessOutcome(paid({ settlementSuccess: null }))).toBe("ok");
     expect(harnessOutcome(paid({ outcome: "validator_failed", settlementSuccess: null, validatorFailures: ["non_empty"] }))).toBe("non_delivery");

@@ -140,17 +140,20 @@ This is the whole message, for a paid call that got a 500:
 }
 ```
 
-- **The payer address adds no new exposure.** Every settled x402 payment is a public USDC transfer from your
-  address to the seller's, with this nonce, on Base. Anyone can already read it from the chain; the row only
-  attaches the outcome you observed.
-- **Keyless ingest.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores no IP
-  address or identity with the row.
+- **What the payer address adds.** Every settled x402 payment is already a public USDC transfer from your
+  address to the seller's pay-to address, with this nonce, on Base; the address, the amount and the seller's
+  pay-to are readable by anyone. What the row adds is the link from that payment to the seller host, the path
+  hash, the outcome you observed, the validator failures and the response hash. Use `"verified"` only if you
+  are comfortable with that association; `"anonymous"` sends the outcome without it.
+- **Keyless ingest, https only.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores
+  no IP address or identity with the row. With `"verified"`, `safeFetch` refuses a plain-http `indexUrl`
+  (loopback excepted, for local testing), and telemetry never follows a redirect.
 - **Bodies and request parameters never leave your machine.** The path is hashed, the query string is dropped
   before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
   validator evidence are never sent.
 - **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
   refusal, never in a failure rate.
-- **Outcomes use the index's names:** `ok`, `non_delivery` (a delivery validator failed after paying),
+- **Outcomes use the index's names:** `ok`, `non_delivery` (a non-2xx answer or a failed delivery validator after paying),
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
   `error`.

@@ -101,16 +101,18 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | --- | --- |
 | `duplicate` | More than one settlement observed for one intent. The client sends one paid request per intent, so in practice it never sees this. |
 | `error` | The settlement header says `success: false` and the answer was not 2xx: the seller rejected the payment (the harness's `not_paid`). Proof is still sent, so the index can confirm nothing moved. |
-| `non_delivery` | `http_status`, `non_empty`, `content_type` or `not_truncated` failed after the payment. |
+| `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. |
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
 | `ok` | None of the above. |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
 
-`validator_failed` stays a v1-only outcome. The payer address is already public on-chain for every settled
-payment, so the v2 row adds no new exposure; bodies, request parameters, headers, the intent id and validator
-evidence are never sent in either version. Each receipt stores the same `proof` and, in `"verified"` mode,
+`validator_failed` stays a v1-only outcome. The payer address, amount and pay-to are public on-chain for every
+settled payment; the v2 row adds the link from that payment to the seller host, path hash, outcome, validator
+failures and response hash. Bodies, request parameters, headers, the intent id and validator evidence are never
+sent in either version. `"verified"` requires an https `indexUrl` (loopback excepted), and no telemetry request
+follows a redirect. Each receipt stores the same `proof` and, in `"verified"` mode,
 `verification_url` = `{indexUrl}/telemetry/<payer>/<nonce>` (404 until the index serves that route).
 
 ## The other request: the index lookup

@@ -14,6 +14,8 @@
   `response.sha256`.
 - **Fix:** v1 settlement headers with `"errorReason": null` (what real v1 facilitators send on success) failed
   to parse, so the receipt lost the transaction hash. The optional settlement fields now accept null.
+- `"verified"` requires an https `indexUrl` (loopback allowed for local testing); telemetry POSTs never follow
+  redirects.
 - `client` in telemetry rows is `x402-safe-fetch/0.2.0`.
 - `examples/conway-topup.ts` uses `telemetry: "verified"`.
 

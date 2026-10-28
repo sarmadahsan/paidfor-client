@@ -140,6 +140,17 @@ function wrapResponse(status: number, statusText: string, headers: HeadersInit, 
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
+/** Verified rows carry the payer and nonce, so they only go over https, or to this machine. */
+function isSecureOrLoopback(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFetch {
   if (!options || typeof options.maxPerCallUsd !== "number" || !(options.maxPerCallUsd > 0)) {
     throw new TypeError("safeFetch: options.maxPerCallUsd must be a positive number");
@@ -153,6 +164,9 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const indexUrl = options.indexUrl === false ? undefined : (options.indexUrl ?? "https://paidfor.dev/v1").replace(/\/$/, "");
   const refuseVerdicts = new Set<Verdict>(options.refuseVerdicts ?? ["avoid"]);
   const validators = validatorsByName(options.validators ?? [...ALL_VALIDATORS]);
+  if (options.telemetry === "verified" && indexUrl !== undefined && !isSecureOrLoopback(indexUrl)) {
+    throw new TypeError(`safeFetch: telemetry "verified" needs an https indexUrl (or a loopback one for local testing), got ${indexUrl}`);
+  }
   const telemetry = indexUrl !== undefined && (options.telemetry === "anonymous" || options.telemetry === "verified") ? options.telemetry : "off";
   const receiptsDir = resolve(options.receiptsDir ?? "./.x402-receipts");
   const baseFetch = options.fetch ?? globalThis.fetch;

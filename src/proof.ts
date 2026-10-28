@@ -124,7 +124,8 @@ export function harnessOutcome(i: OutcomeInput): TelemetryOutcome {
   const n = i.settlements ?? (i.settlementSuccess === false ? 0 : 1);
   if (n === 0 && !delivered) return "error";
   if (n > 1) return "duplicate";
-  if (DELIVERY_VALIDATORS.some((v) => failed.has(v))) return "non_delivery";
+  // A paid non-2xx is non-delivery even when the caller turned http_status off.
+  if (!delivered || DELIVERY_VALIDATORS.some((v) => failed.has(v))) return "non_delivery";
   if (GOODS_VALIDATORS.some((v) => failed.has(v))) return "wrong_goods";
   if (i.amountAtomic !== undefined && i.referenceAtomic !== undefined && exceedsRatio(i.amountAtomic, i.referenceAtomic, DEFAULT_MAX_RATIO)) {
     return "overcharge";

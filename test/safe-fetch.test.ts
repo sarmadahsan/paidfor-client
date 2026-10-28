@@ -405,4 +405,23 @@ describe("safeFetch: verified telemetry (v2)", () => {
     client({ telemetry: "anonymous" });
     expect(warnings).toHaveLength(1);
   });
+
+  it('refuses a plain-http remote indexUrl with "verified", allows loopback and https', () => {
+    expect(() => client({ telemetry: "verified", indexUrl: "http://paidfor.dev/v1" })).toThrow(/needs an https indexUrl/);
+    expect(() => client({ telemetry: "verified", indexUrl: "http://localhost:9/v1" })).not.toThrow();
+    expect(() => client({ telemetry: "verified", indexUrl: "https://paidfor.dev/v1" })).not.toThrow();
+    expect(() => client({ telemetry: "anonymous", indexUrl: "http://paidfor.dev/v1" })).not.toThrow();
+  });
+
+  it("never follows a redirect on the telemetry POST", async () => {
+    const seen: RequestInit[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/telemetry")) seen.push(init ?? {});
+      return globalThis.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    await client({ telemetry: "verified", fetch: fetchImpl })(`${mock.base}/data`);
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.redirect).toBe("error");
+  });
 });
