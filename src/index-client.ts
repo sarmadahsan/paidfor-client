@@ -6,6 +6,8 @@
  * Every field is optional here. Advisory only: this never throws, and anything other than a parseable answer
  * with a known verdict inside the timeout comes back as { available: false }.
  */
+import { CLIENT_HEADER, CLIENT_ID } from "./telemetry.js";
+
 export type Verdict = "avoid" | "caution" | "ok" | "unknown";
 
 export interface IndexCheck {
@@ -85,7 +87,7 @@ export async function checkIndex(indexUrl: string, resourceUrl: string, o: Check
   try {
     const url = `${indexUrl.replace(/\/$/, "")}/check?url=${encodeURIComponent(lookupUrl(resourceUrl))}`;
     const signal = AbortSignal.timeout(timeoutMs);
-    const res = await fetchImpl(url, { headers: { accept: "application/json" }, signal });
+    const res = await fetchImpl(url, { headers: { accept: "application/json", [CLIENT_HEADER]: CLIENT_ID }, signal });
     if (!res.ok) {
       res.body?.cancel().catch(() => undefined);
       return unavailable(`http ${res.status}`);

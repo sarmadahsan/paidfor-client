@@ -18,7 +18,7 @@ No account and no key are needed to send it.
   "amount_usdc": "0.010000",
   "latency_ms": 412,
   "validator_failures": [],
-  "client": "x402-safe-fetch/0.2.1"
+  "client": "x402-safe-fetch/0.2.2"
 }
 ```
 
@@ -31,7 +31,7 @@ No account and no key are needed to send it.
 | `amount_usdc` | Amount of the signed authorization as a 6-decimal string. `"0.000000"` when nothing was signed. |
 | `latency_ms` | Wall time of the call in milliseconds, rounded. |
 | `validator_failures` | Names of the validators that failed, for example `["http_status"]`. Names only, no evidence. |
-| `client` | `x402-safe-fetch/<version>`, `x402-safe-fetch/0.2.1` for this version. |
+| `client` | `x402-safe-fetch/<version>`, `x402-safe-fetch/0.2.2` for this version. |
 
 ## What is never sent (v1)
 
@@ -46,6 +46,8 @@ Calls to free resources (no 402) and replays of a stored intent send nothing.
 ## How it is sent
 
 - Fire-and-forget. The purchase never waits for it.
+- With the header `X-Paidfor-Client: x402-safe-fetch/<version>` (from 0.2.2): the package name and version,
+  nothing else. The pre-pay `GET {indexUrl}/check` sends the same header, also when telemetry is off.
 - 1-second timeout.
 - Any failure is swallowed, including a 404 while the route does not exist yet. Failures are only counted in
   `<receiptsDir>/debug.log`, which never leaves your machine.
@@ -71,7 +73,7 @@ Additive over v1. `v` is `2`, `outcome` uses the harness names, `validator_failu
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.2.1",
+  "client": "x402-safe-fetch/0.2.2",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",

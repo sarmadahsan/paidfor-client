@@ -97,7 +97,7 @@ v1 row:
 
 ```json
 { "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.1" }
+  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.2" }
 ```
 
 Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
@@ -123,7 +123,7 @@ This is the whole message, for a paid call that got a 500:
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.2.1",
+  "client": "x402-safe-fetch/0.2.2",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -152,6 +152,9 @@ This is the whole message, for a paid call that got a 500:
 - **Keyless ingest, https only.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores
   no IP address or identity with the row. With `"verified"`, `safeFetch` refuses a plain-http `indexUrl`
   (loopback excepted, for local testing), and telemetry never follows a redirect.
+- **Client header (0.2.2).** Every request to the index, the pre-pay check and the telemetry POST, carries
+  `X-Paidfor-Client: x402-safe-fetch/<version>`: the package name and version, nothing else. The index uses it
+  only to count calls per client.
 - **Bodies and request parameters never leave your machine.** The path is hashed, the query string is dropped
   before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
   validator evidence are never sent.

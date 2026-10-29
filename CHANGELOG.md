@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+- **Client header.** Every request to the index (`GET {indexUrl}/check` and `POST {indexUrl}/telemetry`) sends
+  `X-Paidfor-Client: x402-safe-fetch/0.2.2`, so paidfor.dev can count checks per client instead of filing them
+  under `api`. The header carries only the package name and version, the same string as the telemetry `client`
+  field. It is sent with telemetry `"off"` too, on the index check; `indexUrl: false` sends no index request.
+- `client` in telemetry rows is `x402-safe-fetch/0.2.2`.
+
 ## 0.2.1
 
 - **Path for sellers the index has never measured.** With `telemetry: "verified"`, when the pre-pay index check

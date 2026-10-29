@@ -11,7 +11,9 @@ import { join } from "node:path";
 import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import { REFUSED_OUTCOMES } from "./proof.js";
 
-export const CLIENT_ID = "x402-safe-fetch/0.2.1";
+export const CLIENT_ID = "x402-safe-fetch/0.2.2";
+/** Sent on every request to the index so it can count calls per client. Carries only CLIENT_ID. */
+export const CLIENT_HEADER = "X-Paidfor-Client";
 
 export interface TelemetryPayload {
   v: 1;
@@ -108,7 +110,7 @@ export function sendTelemetry(indexUrl: string, payload: TelemetryPayload | Tele
     try {
       const res = await fetchImpl(`${indexUrl.replace(/\/$/, "")}/telemetry`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", [CLIENT_HEADER]: CLIENT_ID },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(1000),
         // The route answers directly; never let a redirect carry the row somewhere else (or to plain http).
