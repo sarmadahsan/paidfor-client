@@ -97,7 +97,7 @@ v1 row:
 
 ```json
 { "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.0" }
+  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.1" }
 ```
 
 Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
@@ -109,9 +109,8 @@ paidfor.dev measures sellers with its own wallet, which cannot cover the whole m
 on-chain that you actually paid: it looks up the `AuthorizationUsed(payer, nonce)` event and the matching USDC
 `Transfer` on Base. Rows that do not verify are stored but never counted.
 
-> **Status:** the index verifies v2 rows starting with its next release. Until then it accepts only v1 rows, so a
-> verified row is answered with a 400, which the client swallows and counts in `debug.log`, and
-> `verification_url` answers 404. Nothing about your purchase changes.
+> **Status:** paidfor.dev verifies v2 rows on Base within about five minutes; `verification_url` shows the
+> result for each row.
 
 This is the whole message, for a paid call that got a 500:
 
@@ -124,7 +123,7 @@ This is the whole message, for a paid call that got a 500:
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.2.0",
+  "client": "x402-safe-fetch/0.2.1",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -145,6 +144,11 @@ This is the whole message, for a paid call that got a 500:
   pay-to are readable by anyone. What the row adds is the link from that payment to the seller host, the path
   hash, the outcome you observed, the validator failures and the response hash. Use `"verified"` only if you
   are comfortable with that association; `"anonymous"` sends the outcome without it.
+- **The plain path, for unknown sellers only (0.2.1).** When the index answered `unknown` before paying (it has
+  never measured that seller), the row also carries `"path": "/v1/quote"`: the URL path, never the query string
+  or fragment. The index keeps the host and path of a verified payment to such a seller so it can buy that
+  seller itself at its next scheduled run, and lists it at paidfor.dev/candidates. For every seller the index
+  knows, only `path_hash` is sent, as before. `"anonymous"` never sends a path.
 - **Keyless ingest, https only.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores
   no IP address or identity with the row. With `"verified"`, `safeFetch` refuses a plain-http `indexUrl`
   (loopback excepted, for local testing), and telemetry never follows a redirect.

@@ -17,7 +17,7 @@ import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { wrapFetchWithPayment } from "@x402/fetch";
 import { readBodyTee } from "./body.js";
 import { IntentIndeterminateError, PaymentRefusedError, SafeFetchError, type SafeFetchErrorCode } from "./errors.js";
-import { checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
+import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
 import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
@@ -231,6 +231,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
               latencyMs: r.latency_ms,
               validatorFailures: failureLabels(r.validator_failures, r.response?.status),
               proof: r.proof,
+              unknownSeller: r.index_note === UNKNOWN_SELLER_NOTE,
             })
           : buildPayload({ url: r.url, outcome: r.outcome, amountUsdc: r.amount_usdc, latencyMs: r.latency_ms, validatorFailures: r.validator_failures });
       void sendTelemetry(indexUrl, payload, { receiptsDir, fetchImpl: baseFetch });

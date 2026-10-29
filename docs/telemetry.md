@@ -18,7 +18,7 @@ No account and no key are needed to send it.
   "amount_usdc": "0.010000",
   "latency_ms": 412,
   "validator_failures": [],
-  "client": "x402-safe-fetch/0.2.0"
+  "client": "x402-safe-fetch/0.2.1"
 }
 ```
 
@@ -31,7 +31,7 @@ No account and no key are needed to send it.
 | `amount_usdc` | Amount of the signed authorization as a 6-decimal string. `"0.000000"` when nothing was signed. |
 | `latency_ms` | Wall time of the call in milliseconds, rounded. |
 | `validator_failures` | Names of the validators that failed, for example `["http_status"]`. Names only, no evidence. |
-| `client` | `x402-safe-fetch/<version>`, `x402-safe-fetch/0.2.0` for this version. |
+| `client` | `x402-safe-fetch/<version>`, `x402-safe-fetch/0.2.1` for this version. |
 
 ## What is never sent (v1)
 
@@ -53,8 +53,9 @@ Calls to free resources (no 402) and replays of a stored intent send nothing.
 ## The promise
 
 This client sends paidfor.dev the outcome of a purchase and nothing that identifies the buyer, the wallet,
-or what was bought beyond the seller host and a path hash. If a future version needs to send more, it will
-bump `v`, list the new fields here, and stay opt-in.
+or what was bought beyond the seller host and a path hash. The exceptions are opt-in and listed here: v2
+(`"verified"`) adds the proof of payment, and from 0.2.1 the plain path for a seller the index has never
+measured. If a future version needs to send more, it will list the new fields here and stay opt-in.
 
 ## Version 2 (`"verified"`)
 
@@ -70,7 +71,7 @@ Additive over v1. `v` is `2`, `outcome` uses the harness names, `validator_failu
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.2.0",
+  "client": "x402-safe-fetch/0.2.1",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -107,6 +108,22 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | `ok` | None of the above. |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
+
+### `path` (0.2.1): only for sellers the index has never measured
+
+When the pre-pay `GET {indexUrl}/check` answered and its verdict was `unknown` (the index has no data on the
+seller; not a timeout or an error), that call's v2 row adds one field:
+
+```json
+"path": "/v1/quote"
+```
+
+the URL path exactly as it was hashed for `path_hash` (no query string, no fragment; left out when longer than
+512 characters). For any seller the index knows, `path` is absent and `path_hash` is unchanged. The index keeps
+the host and path of a verified payment to such a seller on its candidate list (`GET {indexUrl}/candidates`) so
+it can buy the seller itself at its next scheduled run, and drops the path from the stored row once the payment
+is checked. These are public API endpoints; the index already saw the same origin and path in the pre-pay
+lookup. `"anonymous"` (v1) never sends it.
 
 `validator_failed` stays a v1-only outcome. The payer address, amount and pay-to are public on-chain for every
 settled payment; the v2 row adds the link from that payment to the seller host, path hash, outcome, validator

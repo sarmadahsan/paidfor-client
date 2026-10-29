@@ -1,7 +1,8 @@
 /**
  * Outcome telemetry. Exactly the payloads in docs/telemetry.md. "anonymous" sends v1: no bodies, no wallet
  * address, no request parameters, no intent id. "verified" sends v2: the v1 fields with harness outcome names,
- * plus `proof` (payer, nonce, pay-to, tx hash) for paid calls so the index can check the payment on Base.
+ * plus `proof` (payer, nonce, pay-to, tx hash) for paid calls so the index can check the payment on Base, and the
+ * plain `path` only when the index answered `unknown` before paying, so it can buy that seller itself.
  * Fire-and-forget with a 1 s timeout; failures are only counted in <receiptsDir>/debug.log.
  */
 import { createHash } from "node:crypto";
@@ -10,7 +11,7 @@ import { join } from "node:path";
 import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import { REFUSED_OUTCOMES } from "./proof.js";
 
-export const CLIENT_ID = "x402-safe-fetch/0.2.0";
+export const CLIENT_ID = "x402-safe-fetch/0.2.1";
 
 export interface TelemetryPayload {
   v: 1;
@@ -53,6 +54,17 @@ export interface TelemetryPayloadV2 {
   client: typeof CLIENT_ID;
   /** Present only when an authorization was signed and sent. Never on a refused outcome. */
   proof?: TelemetryProof;
+  /** The plain URL path (no query string or fragment), only when the index answered `unknown` for this seller. */
+  path?: string;
+}
+
+/** Longest path sent; a longer one is left out rather than risk the row. */
+export const MAX_PATH_LENGTH = 512;
+
+/** The URL path exactly as it is hashed for path_hash, before the trailing slash is removed. Null past MAX_PATH_LENGTH. */
+export function plainPath(url: string): string | null {
+  const p = new URL(url).pathname || "/";
+  return p.length <= MAX_PATH_LENGTH ? p : null;
 }
 
 export function buildPayloadV2(i: {
@@ -62,6 +74,8 @@ export function buildPayloadV2(i: {
   latencyMs: number;
   validatorFailures: string[];
   proof: TelemetryProof | null;
+  /** The pre-pay index check answered `unknown`: send the plain path for this call. */
+  unknownSeller?: boolean;
 }): TelemetryPayloadV2 {
   const p: TelemetryPayloadV2 = {
     ...buildPayload({ ...i, outcome: i.outcome }),
@@ -69,6 +83,10 @@ export function buildPayloadV2(i: {
     outcome: i.outcome,
   };
   if (i.proof && !REFUSED_OUTCOMES.has(i.outcome)) p.proof = { ...i.proof };
+  if (i.unknownSeller) {
+    const path = plainPath(i.url);
+    if (path) p.path = path;
+  }
   return p;
 }
 

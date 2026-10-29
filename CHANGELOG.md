@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- **Path for sellers the index has never measured.** With `telemetry: "verified"`, when the pre-pay index check
+  answered `unknown`, that call's v2 row adds `path`: the plain URL path (no query string or fragment, at most
+  512 characters), so the index can put the seller on its candidate list and buy it itself. For known sellers
+  `path` is absent and `path_hash` is unchanged; `"anonymous"` never sends it. See docs/telemetry.md.
+- `client` in telemetry rows is `x402-safe-fetch/0.2.1`.
+
 ## 0.2.0
 
 - **Verified telemetry.** `telemetry` takes a third value, `"verified"`, which sends a v2 row: the outcome under

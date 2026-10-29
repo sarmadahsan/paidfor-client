@@ -22,6 +22,8 @@ export interface IndexCheck {
 }
 
 const VERDICTS: readonly Verdict[] = ["avoid", "caution", "ok", "unknown"];
+/** `note` when the index answered and said `unknown`: it has never measured this seller (not a timeout or an error). */
+export const UNKNOWN_SELLER_NOTE = "verdict unknown";
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v : null);
 const obj = (v: unknown): Record<string, unknown> | null => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
 
@@ -59,7 +61,7 @@ export function parseCheck(body: unknown, indexUrl: string, resourceUrl: string)
     evidence_url: str(b.evidence_url) ?? str(seller?.evidence_url),
     listed_price_usdc: str(resource?.listed_price_usdc),
   };
-  if (verdict === "unknown") out.note = rawVerdict ? "verdict unknown" : "no verdict in response";
+  if (verdict === "unknown") out.note = rawVerdict ? UNKNOWN_SELLER_NOTE : "no verdict in response";
   return out;
 }
 

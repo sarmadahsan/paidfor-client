@@ -277,7 +277,7 @@ describe("safeFetch: telemetry", () => {
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.2.0" });
+    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.2.1" });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
     for (const leak of ["secret", "abc", "tel-1", account.address.toLowerCase().slice(2), account.address.slice(2)]) expect(raw).not.toContain(leak);
@@ -362,6 +362,33 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(again.receipt).toMatchObject({ replayed: true, proof: r.proof, verification_url: r.verification_url });
     await settle();
     expect(mock.st.telemetry).toHaveLength(1); // a replay sends nothing
+  });
+
+  it("adds the plain path only when the index answered unknown", async () => {
+    indexAnswer("check-unknown");
+    await client({ telemetry: "verified" })(`${mock.base}/v1/quote/?symbol=ETH&key=s3cret#frag`, {}, { intentId: "u-1" });
+    // A known seller and an index that does not answer: no path.
+    indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.010000" } });
+    await client({ telemetry: "verified" })(`${mock.base}/v1/quote`, {}, { intentId: "u-2" });
+    mock.st.index = { kind: "status", status: 503 };
+    await client({ telemetry: "verified" })(`${mock.base}/v1/quote`, {}, { intentId: "u-3" });
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(3);
+    const [unknown, known, down] = mock.st.telemetry as [Record<string, unknown>, Record<string, unknown>, Record<string, unknown>];
+    expect(unknown.path).toBe("/v1/quote/");
+    expect(unknown.path_hash).toBe(sha("/v1/quote"));
+    expect(unknown.proof).toBeDefined();
+    for (const leak of ["symbol", "ETH", "s3cret", "frag"]) expect(JSON.stringify(unknown)).not.toContain(leak);
+    expect(known).not.toHaveProperty("path");
+    expect(down).not.toHaveProperty("path");
+    expect(known.path_hash).toBe(unknown.path_hash);
+  });
+
+  it("anonymous telemetry never sends a path", async () => {
+    indexAnswer("check-unknown");
+    await client({ telemetry: "anonymous" })(`${mock.base}/v1/quote`, {}, { intentId: "u-4" });
+    await settle();
+    expect(mock.st.telemetry[0]).not.toHaveProperty("path");
   });
 
   it("a refusal sends a v2 row without proof", async () => {
