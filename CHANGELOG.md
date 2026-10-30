@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- **Report-only mode.** `reportOnly()`, `withPaidforReporting(fetchWithPayment)` for `x402-fetch` 1.x and
+  `@x402/fetch` 2.x, and `withPaidforReportingAxios(instance)` for `x402-axios` 1.x and `@x402/axios` 2.x: keep your
+  own x402 client and wallet, add one line, and every paid call sends the tx_only row (docs/telemetry.md) with the
+  settlement transaction hash. No pre-pay check, no guard; the index reads the payer and amount from Base.
+- `client` in telemetry rows and the `X-Paidfor-Client` header is `x402-safe-fetch/0.3.0`.
+
 ## 0.2.2
 
 - **Client header.** Every request to the index (`GET {indexUrl}/check` and `POST {indexUrl}/telemetry`) sends

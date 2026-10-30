@@ -97,7 +97,7 @@ v1 row:
 
 ```json
 { "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.2.2" }
+  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.3.0" }
 ```
 
 Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
@@ -123,7 +123,7 @@ This is the whole message, for a paid call that got a 500:
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.2.2",
+  "client": "x402-safe-fetch/0.3.0",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -169,6 +169,34 @@ This is the whole message, for a paid call that got a 500:
 
 The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
 here.
+
+## Report-only: keep your own x402 client, add one line
+
+Already paying with Coinbase's `x402-fetch` / `@x402/fetch` or `x402-axios` / `@x402/axios`? Keep your wallet and your
+setup; wrap the result and every paid call reports its outcome to the index. No pre-pay check, no guard, no key, no
+account: report-only sends the [tx_only row](docs/telemetry.md#tx_only-report-only) after the payment you already made.
+
+```ts
+import { wrapFetchWithPayment } from "x402-fetch"; // or "@x402/fetch"
+import { withPaidforReporting } from "@paidfor/x402-safe-fetch";
+
+const fetchWithPay = withPaidforReporting(wrapFetchWithPayment(fetch, wallet)); // the one added line
+```
+
+```ts
+import axios from "axios";
+import { withPaymentInterceptor } from "x402-axios"; // or wrapAxiosWithPayment from "@x402/axios"
+import { withPaidforReportingAxios } from "@paidfor/x402-safe-fetch";
+
+const api = withPaidforReportingAxios(withPaymentInterceptor(axios.create({ baseURL }), wallet));
+```
+
+The wrapped fetch (or instance) behaves exactly as before. After each response that carries a settlement on Base
+(`PAYMENT-RESPONSE` or `X-PAYMENT-RESPONSE`), it posts the host, the plain path, `ok` for a 2xx or `non_delivery`
+otherwise, the status, and the settlement transaction hash, without waiting and never throwing. The index reads the
+payer and the amount from that transaction on Base and counts the report in the seller's reported series only once it
+is verified. Pass `classify` to set the outcome yourself (or return `null` and call `reportOnly().report()` after your
+own checks). Responses without a settlement (free calls, refusals) send nothing.
 
 ## Errors
 

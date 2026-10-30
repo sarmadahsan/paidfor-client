@@ -6,3 +6,4 @@ export type { ValidatorName } from "./taxonomy.js";
 export type { ValidatorResult } from "./validators/types.js";
 export type { TelemetryPayload, TelemetryPayloadV2 } from "./telemetry.js";
 export type { TelemetryProof, TelemetryOutcome } from "./proof.js";
+export { reportOnly, withPaidforReporting, withPaidforReportingAxios, buildTxOnlyPayload, settlementTx, type ReportOnlyOptions, type ReportOutcome, type TxOnlyPayload, type AxiosLike } from "./report-only.js";
