@@ -2,3 +2,4 @@ node_modules
 dist
 .x402-receipts
 *.log
+*.tgz
