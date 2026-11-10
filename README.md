@@ -159,7 +159,8 @@ This is the whole message, for a paid call that got a 500:
   before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
   validator evidence are never sent.
 - **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
-  refusal, never in a failure rate.
+  refusal, never in a failure rate. A refusal by `authorize` sends no row at all: a buyer's own rule says nothing
+  about the seller.
 - **Outcomes use the index's names:** `ok`, `non_delivery` (a non-2xx answer or a failed delivery validator after paying),
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
