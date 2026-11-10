@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- **`authorize`.** A new option: a callback asked after every local check and before anything is signed. An approval
+  names the EIP-3009 nonce and `validBefore` to sign. Anything else, including a throw or an approval with under ten
+  seconds left, refuses with `refused_authorize` and signs nothing. Without the option nothing changes.
+- `client` in telemetry rows and the `X-Paidfor-Client` header is `x402-safe-fetch/0.4.0`.
+
 ## 0.3.0
 
 - **Report-only mode.** `reportOnly()`, `withPaidforReporting(fetchWithPayment)` for `x402-fetch` 1.x and

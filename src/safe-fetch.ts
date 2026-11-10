@@ -69,7 +69,32 @@ export interface SafeFetchOptions {
   indexTimeoutMs?: number;
   /** Where "caution" verdicts and non-fatal local write failures are reported. Default console. */
   logger?: { warn(msg: string): void };
+  /**
+   * Asks someone else whether this payment may go ahead, after every local check has passed and before anything is
+   * signed. An approval names the EIP-3009 nonce and `validBefore` to sign. Anything but a well-formed approval,
+   * including a throw, is a `refused_authorize`: nothing is signed. Not asked for a free resource or a replay.
+   */
+  authorize?: (request: AuthorizeRequest) => Promise<AuthorizeAnswer>;
 }
+
+/** The quote `authorize` is asked about. `network` is CAIP-2. */
+export interface AuthorizeRequest {
+  intentId: string;
+  url: string;
+  payer: string;
+  payTo: string;
+  amountAtomic: string;
+  network: string;
+  asset: string;
+  scheme: string;
+}
+
+export type AuthorizeAnswer =
+  | { approve: true; /** 32 bytes of 0x-hex. */ nonce: `0x${string}`; /** Unix seconds. */ validBefore: number }
+  | { approve: false; message: string };
+
+/** A facilitator refuses an authorization about to lapse, so an approval with less than this left is not signed. */
+const MIN_AUTH_SECONDS_LEFT = 10;
 
 export interface CallOptions {
   /** Same intentId + same request: returns the stored result, never signs again. Same intentId + different request: throws. */
@@ -363,7 +388,9 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     let idx: IndexCheck | undefined;
     let quote: NormalizedRequirements | undefined;
     let approved: bigint | undefined;
-    let refusal: { code: "refused_verdict" | "refused_ratio" | "refused_max_per_call"; message: string; sellerUrl: string | null } | undefined;
+    let refusal: { code: "refused_verdict" | "refused_ratio" | "refused_max_per_call" | "refused_authorize"; message: string; sellerUrl: string | null } | undefined;
+    let auth: { nonce: `0x${string}`; validBefore: bigint } | undefined;
+    let authSigned = false;
     let failure: { code: SafeFetchErrorCode; message: string } | undefined;
     let signingStarted = false;
     let signedRecorded = false;
@@ -391,7 +418,20 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           q.asset.toLowerCase() === usdc &&
           ((q.extra?.assetTransferMethod as string | undefined) ?? "eip3009") === "eip3009",
       );
-    registerExactEvmScheme(client, { signer, networks: [network], policies: [policy] });
+    // With `authorize` the approval decides the nonce and deadline; the SDK has no way to take them, so they are set
+    // here at signing and on the signed payload in onAfterPaymentCreation.
+    const schemeSigner: ClientEvmSigner = !options.authorize
+      ? signer
+      : {
+          address: signer.address,
+          signTypedData: async (m) => {
+            if (!auth || m.primaryType !== "TransferWithAuthorization") throw new Error("x402-safe-fetch: refusing to sign without an approval");
+            const signature = await signer.signTypedData({ ...m, message: { ...m.message, nonce: auth.nonce, validBefore: auth.validBefore } });
+            authSigned = true;
+            return signature;
+          },
+        };
+    registerExactEvmScheme(client, { signer: schemeSigner, networks: [network], policies: [policy] });
 
     client.onBeforePaymentCreation(async ({ paymentRequired, selectedRequirements }) => {
       signingStarted = true;
@@ -477,6 +517,24 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         return { abort: true, reason: refusal.message };
       }
 
+      // 4. Last, so a payment refused above never takes up a reservation with whoever approves it.
+      if (options.authorize) {
+        let answer: AuthorizeAnswer;
+        try {
+          answer = await options.authorize({ intentId: r.intent_id, url: req.url, payer: signer.address, payTo: norm.payTo, amountAtomic: amount.toString(), network: caip2Network(norm), asset: norm.asset, scheme: norm.scheme });
+        } catch (e) {
+          answer = { approve: false, message: `could not get an approval: ${errMsg(e)}` };
+        }
+        if (answer?.approve === true && !(/^0x[0-9a-fA-F]{64}$/.test(answer.nonce) && Number.isSafeInteger(answer.validBefore) && answer.validBefore - Date.now() / 1000 >= MIN_AUTH_SECONDS_LEFT)) {
+          answer = { approve: false, message: "the approval was malformed or about to lapse" };
+        }
+        if (answer?.approve !== true) {
+          refusal = { code: "refused_authorize", message: `refused to pay ${usd} for ${req.url}: ${answer?.message ?? "no approval"}`, sellerUrl: i.seller_url };
+          return { abort: true, reason: refusal.message };
+        }
+        auth = { nonce: answer.nonce, validBefore: BigInt(answer.validBefore) };
+      }
+
       approved = amount;
       try {
         await lease.update({ phase: "signing", amount_atomic: amount.toString(), pay_to: norm.payTo });
@@ -504,6 +562,14 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       if (!quote || to.toLowerCase() !== quote.payTo.toLowerCase()) {
         failure = { code: "sdk", message: `signed to ${to} does not match requirements.payTo ${quote?.payTo}` };
         throw new Error(failure.message);
+      }
+      if (auth) {
+        if (!authSigned) {
+          failure = { code: "sdk", message: "the payment was not signed with the approval's nonce" };
+          throw new Error(failure.message);
+        }
+        a.nonce = auth.nonce;
+        a.validBefore = auth.validBefore.toString();
       }
       r.nonce = String(a.nonce);
       r.payer = String(a.from).toLowerCase();
@@ -569,7 +635,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         attachProof(r, undefined, {});
         await lease.update({ phase: "refused" }).catch(() => undefined);
         await persistReceipt(r);
-        emitTelemetry(r);
+        // A buyer's own rule says nothing about the seller, so it is not reported to the index.
+        if (refusal.code !== "refused_authorize") emitTelemetry(r);
         throw new PaymentRefusedError(refusal.code, `x402-safe-fetch ${refusal.message}`, refusal.sellerUrl, r);
       }
       if (signedRecorded) {
