@@ -109,7 +109,7 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
 | `ok` | None of the above. |
-| `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** |
+| `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** A refusal by the `authorize` option (`refused_authorize` on the receipt) sends no row at all. |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
 
 ### `path` (0.2.1): only for sellers the index has never measured

@@ -32,13 +32,14 @@ export type TelemetryOutcome =
   | "refused_verdict"
   | "refused_ratio"
   | "refused_max_per_call"
+  | "refused_authorize"
   | "no_acceptable_quote"
   | "paid_no_response"
   | "validator_failed"
   | "error";
 
 /** Outcomes where nothing was paid. Their rows never carry proof and are counted as refusals, not failures. */
-export const REFUSED_OUTCOMES: ReadonlySet<string> = new Set(["refused_verdict", "refused_ratio", "refused_max_per_call", "no_acceptable_quote"]);
+export const REFUSED_OUTCOMES: ReadonlySet<string> = new Set(["refused_verdict", "refused_ratio", "refused_max_per_call", "refused_authorize", "no_acceptable_quote"]);
 
 /** The ratio the harness and this client's default use for "over the reference". */
 export const DEFAULT_MAX_RATIO = 1.1;

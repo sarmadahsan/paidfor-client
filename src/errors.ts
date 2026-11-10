@@ -4,6 +4,7 @@ export type SafeFetchErrorCode =
   | "refused_verdict"
   | "refused_ratio"
   | "refused_max_per_call"
+  | "refused_authorize"
   | "no_acceptable_quote"
   | "intent_conflict"
   | "intent_indeterminate"
@@ -25,11 +26,11 @@ export class SafeFetchError extends Error {
   }
 }
 
-/** Refused before any signature: seller verdict, price ratio, or per-call cap. Nothing was paid. */
+/** Refused before any signature: seller verdict, price ratio, per-call cap, or `authorize`. Nothing was paid. */
 export class PaymentRefusedError extends SafeFetchError {
   override name = "PaymentRefusedError";
   constructor(
-    code: "refused_verdict" | "refused_ratio" | "refused_max_per_call",
+    code: "refused_verdict" | "refused_ratio" | "refused_max_per_call" | "refused_authorize",
     message: string,
     readonly sellerUrl: string | null,
     receipt?: Receipt,

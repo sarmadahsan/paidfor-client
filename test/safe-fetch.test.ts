@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type SafeFetchOptions } from "../src/index.js";
+import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type AuthorizeRequest, type SafeFetchOptions } from "../src/index.js";
+import { decodeHeaderJson } from "../src/x402/types.js";
 import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
 
 let mock: Mock;
@@ -178,6 +179,78 @@ describe("safeFetch: refusals (nothing signed)", () => {
   });
 });
 
+describe("safeFetch: authorize", () => {
+  const REF = `0x${"7a".repeat(32)}` as const;
+  const later = () => Math.floor(Date.now() / 1000) + 120;
+  /** The signed payload the seller received. */
+  function capture() {
+    const sent: { nonce: string; validBefore: string }[] = [];
+    const f: typeof fetch = (input, init) => {
+      const h = new Headers(init?.headers).get("payment-signature");
+      if (h) sent.push((decodeHeaderJson(h) as { payload: { authorization: { nonce: string; validBefore: string } } }).payload.authorization);
+      return fetch(input, init);
+    };
+    return { sent, f };
+  }
+
+  it("signs the approval's nonce and validBefore, and the seller's signature check passes", async () => {
+    const { sent, f } = capture();
+    const validBefore = later();
+    const asked: AuthorizeRequest[] = [];
+    const res = await client({ fetch: f, authorize: async (q) => (asked.push(q), { approve: true, nonce: REF, validBefore }) })(`${mock.base}/x`);
+    expect(res.receipt.paid).toBe(true);
+    expect(res.receipt.nonce).toBe(REF);
+    expect(sent).toEqual([expect.objectContaining({ nonce: REF, validBefore: String(validBefore) })]);
+    expect(mock.st.verifyErrors).toEqual([]);
+    expect(asked).toEqual([{ intentId: res.receipt.intent_id, url: `${mock.base}/x`, payer: account.address, payTo, amountAtomic: "10000", network: NETWORK, asset: USDC_SEPOLIA, scheme: "exact" }]);
+  });
+
+  it.each([
+    ["a refusal", async () => ({ approve: false as const, message: "over budget" }), /over budget/],
+    ["a throw", async () => { throw new Error("server down"); }, /server down/],
+    ["a nonce that is not 32 bytes", async () => ({ approve: true as const, nonce: "0x12" as `0x${string}`, validBefore: later() }), /malformed/],
+    ["a deadline about to lapse", async () => ({ approve: true as const, nonce: REF, validBefore: Math.floor(Date.now() / 1000) + 3 }), /about to lapse/],
+    ["no answer", async () => undefined as never, /no approval/],
+  ])("%s signs nothing and sends no telemetry", async (_n, authorize, message) => {
+    const err = await client({ authorize, telemetry: "verified" })(`${mock.base}/x`).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PaymentRefusedError);
+    expect((err as PaymentRefusedError).code).toBe("refused_authorize");
+    expect((err as PaymentRefusedError).message).toMatch(message);
+    expect((err as PaymentRefusedError).receipt?.paid).toBe(false);
+    expect(mock.st.paidCount).toBe(0);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("is not asked when a local check refuses, for a free resource, or for a replay", async () => {
+    let calls = 0;
+    const authorize = async () => (calls++, { approve: true as const, nonce: REF, validBefore: later() });
+    await expect(client({ authorize, maxPerCallUsd: 0.001 })(`${mock.base}/x`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    expect(calls).toBe(0);
+    mock.st.mode = "free";
+    await client({ authorize })(`${mock.base}/x`);
+    expect(calls).toBe(0);
+    mock.st.mode = "ok";
+    const c = client({ authorize });
+    await c(`${mock.base}/y`, {}, { intentId: "i-1" });
+    expect(calls).toBe(1);
+    const again = await c(`${mock.base}/y`, {}, { intentId: "i-1" });
+    expect(again.receipt.replayed).toBe(true);
+    expect(calls).toBe(1);
+    expect(mock.st.paidCount).toBe(1);
+  });
+
+  it("a refused intent can be asked again with the same id, as a person's approval needs", async () => {
+    let approve = false;
+    const c = client({ authorize: async () => (approve ? { approve: true, nonce: REF, validBefore: later() } : { approve: false, message: "waiting" }) });
+    await expect(c(`${mock.base}/x`, {}, { intentId: "wait-1" })).rejects.toBeInstanceOf(PaymentRefusedError);
+    approve = true;
+    const res = await c(`${mock.base}/x`, {}, { intentId: "wait-1" });
+    expect(res.receipt.paid).toBe(true);
+    expect(res.receipt.nonce).toBe(REF);
+  });
+});
+
 describe("safeFetch: idempotency", () => {
   it("same intentId + same request returns the stored result and never signs again", async () => {
     const f = client();
@@ -277,7 +350,7 @@ describe("safeFetch: telemetry", () => {
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.3.0" });
+    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.4.0" });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
     for (const leak of ["secret", "abc", "tel-1", account.address.toLowerCase().slice(2), account.address.slice(2)]) expect(raw).not.toContain(leak);

@@ -159,7 +159,8 @@ This is the whole message, for a paid call that got a 500:
   before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
   validator evidence are never sent.
 - **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
-  refusal, never in a failure rate.
+  refusal, never in a failure rate. A refusal by `authorize` sends no row at all: a buyer's own rule says nothing
+  about the seller.
 - **Outcomes use the index's names:** `ok`, `non_delivery` (a non-2xx answer or a failed delivery validator after paying),
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
@@ -169,6 +170,24 @@ This is the whole message, for a paid call that got a 500:
 
 The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
 here.
+
+## Ask before paying
+
+`authorize` asks a service of yours (a budget, a person) about each payment, after the local checks and before anything
+is signed. It fails closed: a throw, or anything but a well-formed approval, refuses with `refused_authorize`.
+
+```ts
+const fetchWithPay = safeFetch(account, {
+  maxPerCallUsd: 0.5,
+  authorize: async (q) => {
+    const d = await askYourPolicyServer(q); // q: intentId, url, payer, payTo, amountAtomic, network, asset, scheme
+    return d.ok ? { approve: true, nonce: d.ref, validBefore: d.deadline } : { approve: false, message: d.why };
+  },
+});
+```
+
+The payment is signed with that `nonce` (32 bytes of hex) and `validBefore` (Unix seconds), so the approval can be found
+on chain. A refusal by `authorize` sends no telemetry.
 
 ## Report-only: keep your own x402 client, add one line
 
@@ -202,7 +221,7 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 
 | Error | `code` | Paid? |
 | --- | --- | --- |
-| `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call` | No |
+| `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | No |
 | `IntentConflictError` | `intent_conflict` | No |
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |
 | `SafeFetchError` | `paid_no_response` | Signed and possibly settled; `receipt.nonce` identifies it |

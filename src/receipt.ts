@@ -14,6 +14,7 @@ export type Outcome =
   | "refused_verdict"
   | "refused_ratio"
   | "refused_max_per_call"
+  | "refused_authorize"
   | "no_acceptable_quote"
   | "no_payment_required"
   | "paid_no_response"
