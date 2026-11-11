@@ -5,6 +5,7 @@ import type { Verdict } from "./index-client.js";
 import type { ReferenceSource } from "./price.js";
 import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import type { ValidatorName } from "./taxonomy.js";
+import type { TeamReceipt } from "./team.js";
 import type { SettlementResponse } from "./x402/types.js";
 import type { ValidatorResult } from "./validators/types.js";
 
@@ -82,6 +83,11 @@ export interface Receipt {
     sha256: string | null;
   } | null;
   error: { code: string; message: string } | null;
+  /**
+   * Team mode only (the `team` option): what the team decided, its `warnings`, and what became of the outcome report.
+   * `outcome_report` is filled in after the receipt file is written, so it is on the returned receipt only.
+   */
+  team?: TeamReceipt;
 }
 
 /** One JSON file per call: <receiptsDir>/<timestamp>-<random>.json. Returns the file name. */
