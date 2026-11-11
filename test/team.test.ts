@@ -1,4 +1,5 @@
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -267,6 +268,35 @@ describe("team mode: outcome queue", () => {
     await client()(`${mock.base}/free`);
     expect(teamCalls("/v1/team/outcome")).toEqual([]);
     expect((await readdir(q)).sort()).toEqual(["bare.json", "other.json"]);
+  });
+
+  it("two keys queueing the same intent and auth_ref in one directory keep separate files", async () => {
+    outcomeAnswer = () => ({ status: 503 });
+    const q = join(dir, "team-outcomes");
+    const body = { wallet: account.address, intent_id: "same", auth_ref: REF, paid: false };
+    const a = new TeamClient({ origin: ORIGIN, key: KEY, queueDir: q, fetch: fakeFetch, retryDelayMs: 1 });
+    const b = new TeamClient({ origin: ORIGIN, key: "pft_other_key", queueDir: q, fetch: fakeFetch, retryDelayMs: 1 });
+    expect(await a.report(body)).toBe("queued");
+    expect(await b.report({ ...body, paid: true, settlement_ref: TX, outcome: "ok" })).toBe("queued");
+    expect(await readdir(q)).toHaveLength(2);
+    expect(await a.pending()).toEqual([body]);
+    expect(await b.pending()).toEqual([expect.objectContaining({ paid: true })]);
+  });
+
+  it("still reads an entry stored under the older file name, for its own key only", async () => {
+    const q = join(dir, "team-outcomes");
+    const a = new TeamClient({ origin: ORIGIN, key: KEY, queueDir: q, fetch: fakeFetch });
+    outcomeAnswer = () => ({ status: 503 });
+    const body = { wallet: account.address, intent_id: "old", auth_ref: REF, paid: false };
+    await new TeamClient({ origin: ORIGIN, key: KEY, queueDir: q, fetch: fakeFetch, retryDelayMs: 1 }).report(body);
+    const [name] = await readdir(q);
+    const legacy = `${createHash("sha256").update(`old\n${REF}`).digest("hex").slice(0, 40)}.json`;
+    await rename(join(q, name!), join(q, legacy));
+    expect(await new TeamClient({ origin: ORIGIN, key: "pft_other_key", queueDir: q, fetch: fakeFetch }).pending()).toEqual([]);
+    expect(await a.pending()).toEqual([body]);
+    outcomeAnswer = () => ({ status: 200, body: { ok: true } });
+    await a.flush();
+    expect(await readdir(q)).toEqual([]);
   });
 
   it("drains bare entries only with adoptBareEntries", async () => {

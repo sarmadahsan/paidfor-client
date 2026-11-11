@@ -276,7 +276,9 @@ export class TeamClient {
   }
 
   private queueName(body: TeamOutcomeBody): string {
-    return `${createHash("sha256").update(`${body.intent_id}\n${body.auth_ref}`).digest("hex").slice(0, 40)}.json`;
+    // Scoped by origin and key, so two clients sharing a directory never overwrite each other's report. Files named the
+    // older way (intent and auth_ref only) are still read: every file is, and its origin and key_hash decide whose it is.
+    return `${createHash("sha256").update(`${this.origin}\n${this.keyHash}\n${body.intent_id}\n${body.auth_ref}`).digest("hex").slice(0, 40)}.json`;
   }
 
   /** Send the outcome of an approved payment, try once more, and keep it if the server still cannot take it. */
