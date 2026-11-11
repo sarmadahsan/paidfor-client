@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { PaymentRefusedError, TeamRefusedError, readDecision, safeFetch, type SafeFetchOptions, type TeamDecision } from "../src/index.js";
+import { PaymentRefusedError, TeamClient, TeamRefusedError, readDecision, safeFetch, type SafeFetchOptions, type TeamDecision } from "../src/index.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
 import { NETWORK, TX, USDC_SEPOLIA, payTo, startMock, type Mock } from "./mock.js";
 
@@ -201,6 +201,24 @@ describe("team mode: anything but a clean approve pays nothing", () => {
     expect(res.receipt.nonce).toBe(REF);
   });
 
+  it.each([1e300, -5, 0, 1.5, Number.NaN, Infinity, "1800000000", 253_402_300_800])("a decline with retry_after %s keeps its reason and drops the field", async (v) => {
+    authorizeAnswer = () => ({ status: 200, body: { decision: "decline", reason: "released_not_expired", message: "Wait for the approval to lapse.", retry_after: v } });
+    expect(readDecision({ decision: "decline", reason: "r", retry_after: v })).not.toHaveProperty("retry_after");
+    const err = (await client()(`${mock.base}/x`).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err).toBeInstanceOf(TeamRefusedError);
+    expect(err.decision).toMatchObject({ kind: "decline", reason: "released_not_expired" });
+    expect(err.decision).not.toHaveProperty("retry_after");
+    expect(err.message).toMatch(/released_not_expired.*Wait for the approval/);
+    expect(err.message).not.toMatch(/could not get an approval|Invalid time/);
+  });
+
+  it("a decline with a sane retry_after keeps it and names the time", async () => {
+    authorizeAnswer = () => ({ status: 200, body: { decision: "decline", reason: "released_not_expired", message: "Wait.", retry_after: 1_800_000_000 } });
+    const err = (await client()(`${mock.base}/x`).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err.decision).toMatchObject({ kind: "decline", retry_after: 1_800_000_000 });
+    expect(err.message).toMatch(/Ask again after 2027-01-15T08:00:00\.000Z/);
+  });
+
   it("readDecision ignores unknown fields and refuses anything off-contract", () => {
     expect(readDecision({ decision: "approve", auth_ref: REF, valid_before: 1, extra: true })).toEqual({ kind: "approve", auth_ref: REF, valid_before: 1, warnings: [] });
     expect(readDecision(null).kind).toBe("failed");
@@ -239,15 +257,31 @@ describe("team mode: outcome queue", () => {
     expect(warnings.join("\n")).toMatch(/refused with HTTP 409/);
   });
 
-  it("leaves another key's queued reports alone, and drains a bare @paidfor/mcp-style entry", async () => {
+  it("leaves another key's queued reports and bare @paidfor/mcp-style entries alone", async () => {
     const q = join(dir, "team-outcomes");
     await mkdir(q, { recursive: true });
     await writeFile(join(q, "other.json"), JSON.stringify({ v: 1, origin: ORIGIN, key_hash: "0000000000000000", body: { wallet: account.address, intent_id: "other", auth_ref: REF, paid: false } }));
     await writeFile(join(q, "bare.json"), JSON.stringify({ wallet: account.address, intent_id: "bare", auth_ref: REF, paid: false }));
+    outcomeAnswer = () => ({ status: 404, body: { error: "unknown intent" } }); // what another team's report would get
     mock.st.mode = "free";
     await client()(`${mock.base}/free`);
+    expect(teamCalls("/v1/team/outcome")).toEqual([]);
+    expect((await readdir(q)).sort()).toEqual(["bare.json", "other.json"]);
+  });
+
+  it("drains bare entries only with adoptBareEntries", async () => {
+    const q = join(dir, "team-outcomes");
+    await mkdir(q, { recursive: true });
+    await writeFile(join(q, "bare.json"), JSON.stringify({ wallet: account.address, intent_id: "bare", auth_ref: REF, paid: false }));
+    const off = new TeamClient({ origin: ORIGIN, key: KEY, queueDir: q, fetch: fakeFetch });
+    expect(await off.pending()).toEqual([]);
+    await off.flush();
+    expect(teamCalls("/v1/team/outcome")).toEqual([]);
+    const on = new TeamClient({ origin: ORIGIN, key: KEY, queueDir: q, fetch: fakeFetch, adoptBareEntries: true });
+    expect(await on.pending()).toHaveLength(1);
+    await on.flush();
     expect(teamCalls("/v1/team/outcome").map((r) => (r.body as { intent_id: string }).intent_id)).toEqual(["bare"]);
-    expect(await readdir(q)).toEqual(["other.json"]);
+    expect(await readdir(q)).toEqual([]);
   });
 
   it("keeps the report in memory when the disk cannot take it, and sends it before the next payment", async () => {

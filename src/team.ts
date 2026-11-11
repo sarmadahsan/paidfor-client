@@ -6,8 +6,10 @@
  *
  * Ported from @paidfor/mcp src/team.ts (the security-reviewed copy pay_x402 uses). Differences: the origin is checked
  * when the client is made, the queue entry names the origin and a hash of the key it belongs to (so two clients sharing
- * a directory never send each other's reports with the wrong key), a report that cannot be written to disk is kept in
- * memory, and decisions carry the optional `warnings` and `usage` newer servers send.
+ * a directory never send each other's reports with the wrong key), a bare entry in @paidfor/mcp's format (which names no
+ * key) is left untouched unless the caller opts in with `adoptBareEntries`, a report that cannot be written to disk is
+ * kept in memory, `retry_after` is kept only when it is a plausible Unix time, and decisions carry the optional
+ * `warnings` and `usage` newer servers send.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
@@ -106,6 +108,11 @@ export function outcomeFor(r: Receipt, wallet: string, authRef: string): TeamOut
 
 const str = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 
+/** Latest `retry_after` accepted: year 9999. Anything outside (0, this] or not an integer is dropped. */
+const MAX_RETRY_AFTER = 253_402_300_799;
+/** `retry_after` is absolute Unix seconds (docs/team-api.md); a value that cannot be one is dropped, the decline kept. */
+const retryAfter = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 && v <= MAX_RETRY_AFTER ? v : undefined);
+
 function extras(d: Record<string, unknown>): TeamDecisionExtras {
   const warnings = Array.isArray(d.warnings)
     ? d.warnings.flatMap((w): TeamWarning[] => {
@@ -144,7 +151,7 @@ export function readDecision(b: unknown): TeamDecision {
     case "approve":
       return str(d.auth_ref) && typeof d.valid_before === "number" ? { kind: "approve", auth_ref: d.auth_ref, valid_before: d.valid_before, ...ex } : bad;
     case "decline":
-      return str(d.reason) ? { kind: "decline", reason: d.reason, message: message || d.reason, ...(typeof d.retry_after === "number" ? { retry_after: d.retry_after } : {}), ...ex } : bad;
+      return str(d.reason) ? { kind: "decline", reason: d.reason, message: message || d.reason, ...(retryAfter(d.retry_after) !== undefined ? { retry_after: retryAfter(d.retry_after)! } : {}), ...ex } : bad;
     case "needs_approval":
       return str(d.approve_url) && str(d.expires_at) ? { kind: "needs_approval", approve_url: d.approve_url, expires_at: d.expires_at, message, ...ex } : bad;
     case "already_settled":
@@ -184,6 +191,13 @@ export interface TeamClientOptions {
   reportTimeoutMs?: number;
   /** Wait before the second try of a report. Default 250 ms. */
   retryDelayMs?: number;
+  /**
+   * Also send bare queue entries (@paidfor/mcp's format, which names no origin or key) under this client's key, and
+   * delete them once the server has answered. Only for a directory whose bare entries are known to belong to this key,
+   * such as the MCP pointing at its own queue. Default false: bare entries are left untouched, because sent under another
+   * team's key they are refused for good and the report another team needs would be lost.
+   */
+  adoptBareEntries?: boolean;
 }
 
 /** The two team calls and the report queue. safeFetch's `team` option makes one; exported for callers wiring `authorize` themselves. */
@@ -197,6 +211,7 @@ export class TeamClient {
   private readonly authorizeTimeoutMs: number;
   private readonly reportTimeoutMs: number;
   private readonly retryDelayMs: number;
+  private readonly adoptBare: boolean;
   /** Reports that could not be written to disk; sent again like the disk queue, lost if the process ends. */
   private readonly memory = new Map<string, TeamOutcomeBody>();
   private flushing: Promise<void> | null = null;
@@ -214,6 +229,7 @@ export class TeamClient {
     this.authorizeTimeoutMs = o.authorizeTimeoutMs ?? AUTHORIZE_TIMEOUT_MS;
     this.reportTimeoutMs = o.reportTimeoutMs ?? REPORT_TIMEOUT_MS;
     this.retryDelayMs = o.retryDelayMs ?? 250;
+    this.adoptBare = o.adoptBareEntries === true;
   }
 
   private post(path: string, body: unknown, timeoutMs: number): Promise<Response> {
@@ -306,8 +322,8 @@ export class TeamClient {
         const e = JSON.parse(await readFile(file, "utf8")) as Partial<QueueEntry> & Partial<TeamOutcomeBody>;
         if (e.v === 1 && e.body) {
           if (e.origin === this.origin && e.key_hash === this.keyHash) out.push({ file, body: e.body });
-        } else if (str(e.intent_id) && str(e.auth_ref) && str(e.wallet)) {
-          // A bare outcome body, as @paidfor/mcp's queue keeps them: it names no key, so it is this client's.
+        } else if (this.adoptBare && str(e.intent_id) && str(e.auth_ref) && str(e.wallet)) {
+          // A bare outcome body, as @paidfor/mcp's queue keeps them. It names no key; the caller vouched that it is this one's.
           out.push({ file, body: e as TeamOutcomeBody });
         }
       } catch (err) {

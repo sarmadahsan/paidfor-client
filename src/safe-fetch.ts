@@ -210,11 +210,17 @@ function teamReceipt(origin: string, d: TeamDecision): TeamReceipt {
   };
 }
 
+/** An ISO time for Unix seconds, or the bare number; never throws. */
+function unixTime(s: number): string {
+  const d = new Date(s * 1000);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : `Unix time ${String(s)}`;
+}
+
 /** The refusal text for a decision that is not an approval. */
 function teamMessage(d: Exclude<TeamDecision, { kind: "approve" }>, intentId: string): string {
   switch (d.kind) {
     case "decline":
-      return `declined by your team's rules (${d.reason}): ${d.message}${d.retry_after !== undefined ? ` Ask again after ${new Date(d.retry_after * 1000).toISOString()}.` : ""}`;
+      return `declined by your team's rules (${d.reason}): ${d.message}${d.retry_after !== undefined ? ` Ask again after ${unixTime(d.retry_after)}.` : ""}`;
     case "needs_approval":
       return `a person has to approve this payment first: ${d.approve_url} (the request waits until ${d.expires_at}). After they approve it, call again with intentId "${intentId}".${d.message ? ` ${d.message}` : ""}`;
     case "already_settled":

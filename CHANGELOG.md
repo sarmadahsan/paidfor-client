@@ -16,6 +16,8 @@
 - Exported: `TeamRefusedError`, `TeamClient`, `outcomeFor`, `readDecision`, `isKeySafeOrigin`, `TEAM_ORIGIN` and the
   types `TeamOptions`, `TeamDecision`, `TeamDecisionExtras`, `TeamWarning`, `TeamReceipt`, `TeamReportState`,
   `TeamAuthorizeBody`, `TeamOutcomeBody`, `TeamClientOptions`.
+  `TeamClient` leaves bare queue entries (the `@paidfor/mcp` format, which names no key) untouched unless it is made
+  with `adoptBareEntries: true`; the `team` option never adopts them.
 - `client` in telemetry rows and the `X-Paidfor-Client` header is `x402-safe-fetch/0.5.0`.
 
 ## 0.4.0
