@@ -16,12 +16,13 @@ import type { ClientEvmSigner } from "@x402/evm";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { wrapFetchWithPayment } from "@x402/fetch";
 import { readBodyTee } from "./body.js";
-import { IntentIndeterminateError, PaymentRefusedError, SafeFetchError, type SafeFetchErrorCode } from "./errors.js";
+import { IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type SafeFetchErrorCode } from "./errors.js";
 import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
 import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
 import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
+import { TEAM_ORIGIN, TeamClient, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt } from "./team.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
 import { CLIENT_ID, buildPayload, buildPayloadV2, sendTelemetry } from "./telemetry.js";
 import { runAllValidators, validatorsByName } from "./validators/index.js";
@@ -73,8 +74,19 @@ export interface SafeFetchOptions {
    * Asks someone else whether this payment may go ahead, after every local check has passed and before anything is
    * signed. An approval names the EIP-3009 nonce and `validBefore` to sign. Anything but a well-formed approval,
    * including a throw, is a `refused_authorize`: nothing is signed. Not asked for a free resource or a replay.
+   * The low-level hook behind `team`; passing both throws.
    */
   authorize?: (request: AuthorizeRequest) => Promise<AuthorizeAnswer>;
+  /**
+   * Team mode: a paidfor team account's budgets, approvals and ledger. Before signing, every payment asks
+   * `{origin}/v1/team/authorize` with the key and signs the nonce and deadline the team minted; anything but a clean
+   * approval pays nothing and throws TeamRefusedError. Every approval's outcome is reported to `/v1/team/outcome`; a
+   * report the server could not take is kept in `<receiptsDir>/team-outcomes` and sent before the next payment.
+   *
+   * When omitted (and `authorize` is not set), the key is read from the environment variable PAIDFOR_TEAM_KEY if it
+   * is set. `false` turns team mode off whatever the environment says. Passing `team` together with `authorize` throws.
+   */
+  team?: TeamOptions | false;
 }
 
 /** The quote `authorize` is asked about. `network` is CAIP-2. */
@@ -165,6 +177,53 @@ function wrapResponse(status: number, statusText: string, headers: HeadersInit, 
 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
+let envNoticeShown = false;
+
+/** `team`, or PAIDFOR_TEAM_KEY when neither `team` nor `authorize` is given. */
+function resolveTeam(o: SafeFetchOptions): { team: TeamOptions; fromEnv: boolean } | undefined {
+  if (o.team === false) return undefined;
+  if (o.team !== undefined) {
+    if (!o.team || typeof o.team !== "object" || typeof o.team.key !== "string" || !o.team.key.trim()) {
+      throw new TypeError("safeFetch: team must be { key: string, origin?: string } or false");
+    }
+    if (o.authorize) throw new TypeError("safeFetch: pass team or authorize, not both (team supplies its own authorize)");
+    return { team: o.team, fromEnv: false };
+  }
+  if (o.authorize) return undefined; // the caller asks someone itself; the environment is not consulted
+  const key = typeof process !== "undefined" ? process.env?.PAIDFOR_TEAM_KEY?.trim() : undefined;
+  return key ? { team: { key }, fromEnv: true } : undefined;
+}
+
+function teamReceipt(origin: string, d: TeamDecision): TeamReceipt {
+  return {
+    origin,
+    decision: d.kind,
+    auth_ref: d.kind === "approve" ? d.auth_ref : null,
+    reason: d.kind === "decline" ? d.reason : null,
+    message: d.kind === "approve" ? null : d.message || null,
+    approve_url: d.kind === "needs_approval" ? d.approve_url : null,
+    expires_at: d.kind === "needs_approval" ? d.expires_at : null,
+    ledger_id: d.ledger_id ?? null,
+    warnings: d.warnings,
+    usage: d.usage ?? null,
+    outcome_report: null,
+  };
+}
+
+/** The refusal text for a decision that is not an approval. */
+function teamMessage(d: Exclude<TeamDecision, { kind: "approve" }>, intentId: string): string {
+  switch (d.kind) {
+    case "decline":
+      return `declined by your team's rules (${d.reason}): ${d.message}${d.retry_after !== undefined ? ` Ask again after ${new Date(d.retry_after * 1000).toISOString()}.` : ""}`;
+    case "needs_approval":
+      return `a person has to approve this payment first: ${d.approve_url} (the request waits until ${d.expires_at}). After they approve it, call again with intentId "${intentId}".${d.message ? ` ${d.message}` : ""}`;
+    case "already_settled":
+      return `this purchase was already paid (settlement ${d.settlement_ref}, outcome ${d.outcome}); nothing was paid again. For a new purchase use a new intentId.`;
+    case "failed":
+      return `the team's rules could not be checked: ${d.message} Calling again with intentId "${intentId}" is safe.`;
+  }
+}
+
 /** Verified rows carry the payer and nonce, so they only go over https, or to this machine. */
 function isSecureOrLoopback(url: string): boolean {
   try {
@@ -200,6 +259,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const maxAtomic = usdToAtomic(options.maxPerCallUsd);
   const intents = new IntentStore(receiptsDir);
   const prices = new PriceBook(receiptsDir);
+  const teamConf = resolveTeam(options);
 
   const warn = (msg: string) => {
     try {
@@ -210,6 +270,22 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   };
 
   if (telemetry === "verified") void verifiedNotice();
+
+  const team = teamConf
+    ? new TeamClient({
+        origin: teamConf.team.origin ?? TEAM_ORIGIN,
+        key: teamConf.team.key,
+        queueDir: join(receiptsDir, "team-outcomes"),
+        fetch: baseFetch,
+        warn,
+        ...(teamConf.team.authorizeTimeoutMs !== undefined ? { authorizeTimeoutMs: teamConf.team.authorizeTimeoutMs } : {}),
+        ...(teamConf.team.reportTimeoutMs !== undefined ? { reportTimeoutMs: teamConf.team.reportTimeoutMs } : {}),
+      })
+    : undefined;
+  if (team && teamConf?.fromEnv && !envNoticeShown) {
+    envNoticeShown = true;
+    warn(`team mode is on from PAIDFOR_TEAM_KEY: every payment asks ${team.origin} first. Pass team: false to turn it off.`);
+  }
 
   /** Once per receipts directory: say what verified telemetry sends and where it is documented. */
   async function verifiedNotice() {
@@ -382,7 +458,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     return wrapResponse(stored.status, stored.statusText, stored.headers, body, stored.url || req.url, r);
   }
 
-  async function live(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+  async function live(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number, authorize: SafeFetchOptions["authorize"]): Promise<SafeResponse> {
     let quoteResult: QuoteResult | undefined;
     let indexP: Promise<IndexCheck> | undefined;
     let idx: IndexCheck | undefined;
@@ -420,7 +496,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       );
     // With `authorize` the approval decides the nonce and deadline; the SDK has no way to take them, so they are set
     // here at signing and on the signed payload in onAfterPaymentCreation.
-    const schemeSigner: ClientEvmSigner = !options.authorize
+    const schemeSigner: ClientEvmSigner = !authorize
       ? signer
       : {
           address: signer.address,
@@ -518,10 +594,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       }
 
       // 4. Last, so a payment refused above never takes up a reservation with whoever approves it.
-      if (options.authorize) {
+      if (authorize) {
         let answer: AuthorizeAnswer;
         try {
-          answer = await options.authorize({ intentId: r.intent_id, url: req.url, payer: signer.address, payTo: norm.payTo, amountAtomic: amount.toString(), network: caip2Network(norm), asset: norm.asset, scheme: norm.scheme });
+          answer = await authorize({ intentId: r.intent_id, url: req.url, payer: signer.address, payTo: norm.payTo, amountAtomic: amount.toString(), network: caip2Network(norm), asset: norm.asset, scheme: norm.scheme });
         } catch (e) {
           answer = { approve: false, message: `could not get an approval: ${errMsg(e)}` };
         }
@@ -744,12 +820,49 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     const req = await normalizeRequest(input, init);
     const requestHash = hashRequest(req);
     const intentId = call.intentId ?? randomUUID();
+    // Owed team reports go first: until the server has them it answers the same purchase with pending_settlement.
+    if (team) await team.flush();
     const lease = await intents.acquire(intentId, requestHash);
     try {
       const r = baseReceipt(req, intentId, requestHash, t0);
-      return lease.replay ? await replay(lease, req, r, t0) : await live(lease, req, r, t0);
+      if (lease.replay) return await replay(lease, req, r, t0);
+      if (!team) return await live(lease, req, r, t0, options.authorize);
+      return await teamLive(team, lease, req, r, t0);
     } finally {
       await lease.release();
     }
   };
+
+  /** live() with the team asked before signing, and every approval's outcome reported after. */
+  async function teamLive(team: TeamClient, lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+    let decision: TeamDecision | undefined;
+    const authorize = async (q: AuthorizeRequest): Promise<AuthorizeAnswer> => {
+      const d = await team.authorize({ wallet: q.payer, intent_id: q.intentId, resource_url: q.url, pay_to: q.payTo, amount_atomic: q.amountAtomic, network: q.network, asset: q.asset, scheme: q.scheme, protocol: "x402" });
+      decision = d;
+      r.team = teamReceipt(team.origin, d);
+      return d.kind === "approve" ? { approve: true, nonce: d.auth_ref as `0x${string}`, validBefore: d.valid_before } : { approve: false, message: teamMessage(d, q.intentId) };
+    };
+    /** Say what happened to an approved payment, paid or not. Nothing to say when nothing was approved. */
+    const settle = async (rec: Receipt | undefined) => {
+      if (decision?.kind !== "approve") return;
+      if (!rec) {
+        warn(`no receipt for approved intent ${r.intent_id}, so no team outcome was reported; the approval keeps counting against the budgets`);
+        return;
+      }
+      const state = await team.report(outcomeFor(rec, signer.address, decision.auth_ref));
+      if (rec.team) rec.team.outcome_report = state;
+    };
+    let res: SafeResponse;
+    try {
+      res = await live(lease, req, r, t0, authorize);
+    } catch (e) {
+      await settle(e instanceof SafeFetchError ? e.receipt : undefined);
+      if (decision && e instanceof PaymentRefusedError && e.code === "refused_authorize") {
+        throw new TeamRefusedError(decision, e.message, e.sellerUrl, e.receipt);
+      }
+      throw e;
+    }
+    await settle(res.receipt);
+    return res;
+  }
 }

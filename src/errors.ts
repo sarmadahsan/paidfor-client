@@ -1,4 +1,5 @@
 import type { Receipt } from "./receipt.js";
+import type { TeamDecision } from "./team.js";
 
 export type SafeFetchErrorCode =
   | "refused_verdict"
@@ -36,6 +37,25 @@ export class PaymentRefusedError extends SafeFetchError {
     receipt?: Receipt,
   ) {
     super(code, message, receipt);
+  }
+}
+
+/**
+ * The team (the `team` option) did not approve this payment, or could not be asked. Nothing was paid. `decision` says
+ * why: `needs_approval` carries the `approve_url` to show a person (then call again with the same intentId),
+ * `already_settled` means this intent was paid before, `decline` carries the server's `reason`, `failed` means the
+ * team could not be asked. An `approve` here was unusable (malformed, or about to lapse) and is reported as not paid.
+ * Always code `refused_authorize`.
+ */
+export class TeamRefusedError extends PaymentRefusedError {
+  override name = "TeamRefusedError";
+  constructor(
+    readonly decision: TeamDecision,
+    message: string,
+    sellerUrl: string | null,
+    receipt?: Receipt,
+  ) {
+    super("refused_authorize", message, sellerUrl, receipt);
   }
 }
 

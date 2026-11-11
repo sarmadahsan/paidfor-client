@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+- **Team mode: `team: { key }`.** Budgets per wallet, human approvals and a ledger from a paidfor team account, with
+  one option. Every payment asks `{origin}/v1/team/authorize` (default origin `https://paidfor.dev`) before signing
+  and signs the minted nonce and deadline; anything but a clean approval throws `TeamRefusedError` (code
+  `refused_authorize`, with `decision`: `decline`, `needs_approval` with `approve_url` and `expires_at`,
+  `already_settled`, or `failed`) and signs nothing. Every approval's outcome is reported to `/v1/team/outcome`; a
+  report the server could not take is kept in `<receiptsDir>/team-outcomes` (in memory if the disk cannot take it)
+  and sent before the next payment. `receipt.team` carries the decision, the server's `warnings` and the report's
+  state. The key goes only to the team origin; a plain-http origin off this machine is refused.
+- **`PAIDFOR_TEAM_KEY` turns team mode on** when `team` and `authorize` are both left out. If that variable is in
+  the environment of a program upgrading from 0.4.x, its payments now ask the team first; pass `team: false` to keep
+  the old behaviour. `team` and `authorize` together throw.
+- Exported: `TeamRefusedError`, `TeamClient`, `outcomeFor`, `readDecision`, `isKeySafeOrigin`, `TEAM_ORIGIN` and the
+  types `TeamOptions`, `TeamDecision`, `TeamDecisionExtras`, `TeamWarning`, `TeamReceipt`, `TeamReportState`,
+  `TeamAuthorizeBody`, `TeamOutcomeBody`, `TeamClientOptions`.
+- `client` in telemetry rows and the `X-Paidfor-Client` header is `x402-safe-fetch/0.5.0`.
+
 ## 0.4.0
 
 - **`authorize`.** A new option: a callback asked after every local check and before anything is signed. An approval

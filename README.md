@@ -171,6 +171,41 @@ This is the whole message, for a paid call that got a 500:
 The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
 here.
 
+## With a team account
+
+A free [paidfor team account](https://paidfor.dev/team) adds budgets per wallet, human approvals and a ledger. Add
+the team key, nothing else:
+
+```ts
+const fetchWithPay = safeFetch(account, {
+  maxPerCallUsd: 0.5,
+  team: { key: process.env.PAIDFOR_TEAM_KEY! },
+});
+```
+
+What you get:
+
+- Before signing, every payment asks `https://paidfor.dev/v1/team/authorize` and signs only with the nonce and
+  deadline the team minted. Anything but a clean approval pays nothing and throws `TeamRefusedError` (code
+  `refused_authorize`): a decline (`decision.reason`, `decision.message`), a payment waiting for a person
+  (`decision.approve_url` and `decision.expires_at`: show the link, then call again with the same `intentId`), an
+  intent the team already saw paid (`already_settled`), or a team that could not be asked (timeout, 5xx, an answer
+  it could not read). Your local caps still apply: a payment must pass both.
+- Every approval's outcome, paid or not, is reported to the team's ledger. A report the server could not take is
+  kept in `<receiptsDir>/team-outcomes` and sent before the next payment (in memory, until the process ends, if
+  the disk cannot take it).
+- `receipt.team` says what the team decided, carries any `warnings` the server sent, and `outcome_report` (`sent`,
+  `queued` or `rejected`).
+
+The wallet must be registered to the team: on [paidfor.dev/team](https://paidfor.dev/team), or with
+`npx -y @paidfor/mcp@0.7.0 init --wallet --link` (add `--key-file <path>` for a key file of your own). The key goes
+only to the team origin, never to a seller, and is never logged. `team` also takes `origin` (https only, or
+http on localhost), `authorizeTimeoutMs` (default 10000) and `reportTimeoutMs` (default 5000).
+
+When `team` is left out and `PAIDFOR_TEAM_KEY` is set in the environment, team mode turns on by itself (a
+one-line notice says so); `team: false` turns it off. `team` and `authorize` together throw: `team` supplies its own
+`authorize`, and with your own `authorize` the environment is not read.
+
 ## Ask before paying
 
 `authorize` asks a service of yours (a budget, a person) about each payment, after the local checks and before anything
@@ -222,6 +257,7 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 | Error | `code` | Paid? |
 | --- | --- | --- |
 | `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | No |
+| `TeamRefusedError` (a `PaymentRefusedError`) | `refused_authorize`; `decision` says why | No |
 | `IntentConflictError` | `intent_conflict` | No |
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |
 | `SafeFetchError` | `paid_no_response` | Signed and possibly settled; `receipt.nonce` identifies it |
