@@ -10,12 +10,15 @@
   the approval is reported as not paid (`paid: false`), so the team releases it instead of recording a settlement.
   `reported_outcome` is `error`, the harness name for "not paid"; `proof` is null. A 402 whose settlement header
   cannot be read is still treated as paid, since it may name a settlement.
-- **Retrying a rejected payment.** The intent is kept in the new phase `rejected` with the signed nonce and
-  deadline, and a retry with the same `intentId` is allowed (before, it replayed the 402). Without `team` or
-  `authorize` the retry signs the same nonce again, so at most one of the two authorizations can ever settle. With an
-  approval naming a different nonce, the retry refuses with `refused_authorize` until the rejected authorization's
-  deadline has passed. A new `intentId` signs a new nonce as before. See "When the seller rejects the payment" in
-  the README for what to check on chain.
+- **Retrying a rejected payment.** The intent is kept in the new phase `rejected` with the signed nonce, deadline,
+  payer, network and asset, and a retry with the same `intentId` is allowed (before, it replayed the 402). Without
+  `team` or `authorize` the retry signs the same nonce again, so at most one of the two authorizations can ever
+  settle. A retry from another wallet, network or asset throws `IntentConflictError` and signs nothing (the same
+  nonce there would be a second authorization that could also settle). With an approval naming a different nonce,
+  the retry refuses with `refused_authorize` until the rejected authorization's deadline has passed. The deadline
+  only stops later use of the old signature; it does not show the old one was never used, which only
+  `authorizationState(payer, nonce)` on the USDC contract does. A new `intentId` signs a new nonce as before. See
+  "When the seller rejects the payment" in the README.
 - New receipt field `valid_before`: the signed authorization's deadline, Unix seconds (null when nothing was signed).
   `Outcome` gains `payment_rejected`. Both are additive; older receipts lack the field.
 - **Team mode tells the team about local refusals.** A payment refused before the team is asked (`refused_verdict`,

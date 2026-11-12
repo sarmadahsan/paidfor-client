@@ -345,12 +345,15 @@ describe("safeFetch: a payment the seller rejects (HTTP 402 again, nothing settl
     expect(r.payer).toBe(account.address.toLowerCase());
     expect(r.valid_before).toBeGreaterThanOrEqual(t + 50); // the seller's maxTimeoutSeconds is 60
     expect(r.error?.code).toBe("payment_rejected");
-    expect(r.error?.message).toMatch(/settled nothing, so nothing was paid.*nonce 0x[0-9a-f]{64}.*could still be settled until \d{4}-/);
+    expect(r.error?.message).toMatch(/settled nothing, so nothing was paid.*nonce 0x[0-9a-f]{64}.*can still be used until \d{4}-.*only stops later use.*authorizationState\(payer, nonce\)/);
     // No price is learnt from it, and the receipt on disk says the same.
     await expect(readFile(join(dir, "prices.json"), "utf8")).rejects.toThrow();
     const [file] = await receipts();
     expect(JSON.parse(await readFile(join(dir, file!), "utf8"))).toMatchObject({ outcome: "payment_rejected", paid: false, nonce: r.nonce, valid_before: r.valid_before });
-    expect(JSON.parse(await readFile(intentFile("empty-wallet"), "utf8"))).toMatchObject({ phase: "rejected", rejected: { nonce: r.nonce, valid_before: r.valid_before } });
+    expect(JSON.parse(await readFile(intentFile("empty-wallet"), "utf8"))).toMatchObject({
+      phase: "rejected",
+      rejected: { nonce: r.nonce, valid_before: r.valid_before, payer: account.address.toLowerCase(), network: NETWORK, asset: USDC_SEPOLIA.toLowerCase() },
+    });
   });
 
   it.each(["anonymous", "verified"] as const)("sends no %s telemetry row", async (telemetry) => {
@@ -387,6 +390,55 @@ describe("safeFetch: a payment the seller rejects (HTTP 402 again, nothing settl
     const paid = await client()(`${mock.base}/data`, {}, { intentId: "restart" });
     expect(paid.receipt.nonce).toBe(first.receipt.nonce);
     expect(mock.st.nonces).toEqual([first.receipt.nonce, first.receipt.nonce]);
+  });
+
+  it("a retry from another wallet throws IntentConflictError and signs nothing", async () => {
+    mock.st.mode = "reject_402";
+    const first = await client()(`${mock.base}/data`, {}, { intentId: "two-wallets" });
+    mock.st.mode = "ok";
+    const other = privateKeyToAccount(generatePrivateKey());
+    const err = (await safeFetch(other, { maxPerCallUsd: 0.5, indexUrl: `${mock.base}/v1`, receiptsDir: dir, network: NETWORK, logger: { warn: (m) => warnings.push(m) } })(`${mock.base}/data`, {}, { intentId: "two-wallets" }).catch((e: unknown) => e)) as IntentConflictError;
+    expect(err).toBeInstanceOf(IntentConflictError);
+    expect(err.code).toBe("intent_conflict");
+    expect(err.message).toContain(`payer ${account.address.toLowerCase()} vs this wallet ${other.address.toLowerCase()}`);
+    expect(err.message).toMatch(/Nothing was signed.*authorizationState\(payer, nonce\).*new intentId/);
+    expect(mock.st.nonces).toEqual([first.receipt.nonce]);
+    expect(mock.st.paidCount).toBe(1);
+    // The rejection is still on record, so the original wallet can still retry with its nonce.
+    const paid = await client()(`${mock.base}/data`, {}, { intentId: "two-wallets" });
+    expect(paid.receipt).toMatchObject({ outcome: "ok", nonce: first.receipt.nonce });
+  });
+
+  it.each<[string, (rec: { rejected: Record<string, unknown> }) => void, RegExp]>([
+    ["another network", (rec) => void (rec.rejected.network = "eip155:8453"), /network eip155:8453 vs eip155:84532/],
+    ["another asset", (rec) => void (rec.rejected.asset = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"), /asset 0x833589fcd6edb6e08f4c7c32d4f71b54bda02913 vs/],
+    ["no payer on record (an older intent file)", (rec) => void delete rec.rejected.payer, /payer was not recorded/],
+  ])("a rejected authorization for %s is not reused: IntentConflictError, nothing signed", async (_n, edit, message) => {
+    mock.st.mode = "reject_402";
+    await client()(`${mock.base}/data`, {}, { intentId: "bound" });
+    const rec = JSON.parse(await readFile(intentFile("bound"), "utf8"));
+    edit(rec);
+    await writeFile(intentFile("bound"), JSON.stringify(rec));
+    mock.st.mode = "ok";
+    const err = (await client()(`${mock.base}/data`, {}, { intentId: "bound" }).catch((e: unknown) => e)) as IntentConflictError;
+    expect(err).toBeInstanceOf(IntentConflictError);
+    expect(err.message).toMatch(message);
+    expect(err.receipt?.paid).toBe(false);
+    expect(mock.st.paidCount).toBe(1);
+  });
+
+  it("with authorize, another wallet is refused before the approval is asked for", async () => {
+    mock.st.mode = "reject_402";
+    const REF = `0x${"7a".repeat(32)}` as const;
+    let asked = 0;
+    const authorize = async () => (asked++, { approve: true as const, nonce: REF, validBefore: Math.floor(Date.now() / 1000) + 120 });
+    await client({ authorize })(`${mock.base}/data`, {}, { intentId: "ap-wallets" });
+    mock.st.mode = "ok";
+    const other = privateKeyToAccount(generatePrivateKey());
+    const err = await safeFetch(other, { maxPerCallUsd: 0.5, indexUrl: `${mock.base}/v1`, receiptsDir: dir, network: NETWORK, authorize })(`${mock.base}/data`, {}, { intentId: "ap-wallets" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(IntentConflictError);
+    expect(asked).toBe(1);
+    expect(mock.st.paidCount).toBe(1);
   });
 
   it("a new intentId signs a new nonce", async () => {

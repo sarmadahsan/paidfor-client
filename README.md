@@ -45,8 +45,8 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
    the same `intentId` and request returns the stored response and never signs again. A retry with the same
    `intentId` and a different request throws `IntentConflictError`. If a payment was signed but no response was
    stored, a retry throws `IntentIndeterminateError` instead of paying again. A payment the seller rejected
-   (`payment_rejected`, below) may be retried with the same `intentId`: it signs the same nonce again, so at most
-   one of the two authorizations can ever settle.
+   (`payment_rejected`, below) may be retried with the same `intentId` from the same wallet: it signs the same
+   nonce again, so at most one of the two authorizations can ever settle.
 3. **After the response.** The configured validators run on the paid response. `res.receipt` carries the intent
    id, quote, amount, reference price and its source, seller verdict, validator results, the settlement header,
    and the on-chain tx hash when the header carries it. The same receipt is written to the receipts directory as
@@ -88,19 +88,26 @@ A `payment_rejected` receipt has `paid: false`, no `tx_hash`, no `proof`, and `e
 No price is learnt from it, no telemetry row is sent (it says nothing about the seller), and in team mode the
 approval is reported as not paid, so the team releases it.
 
-The one real risk: the signed EIP-3009 authorization stays valid until its deadline, so whoever holds it (the seller
-or its facilitator) could still settle it later, for example once the wallet is funded. The receipt keeps what you
-need to check: `payer`, `nonce` and `valid_before` (Unix seconds). After `valid_before` has passed the authorization
-can never be used; to be sure nothing moved, read `authorizationState(payer, nonce)` on the USDC contract on Base
-(`true` means it was used), or look for that `AuthorizationUsed` event. Until then:
+The one real risk: the signed EIP-3009 authorization can still be used until its deadline, so whoever holds it (the
+seller or its facilitator) could settle it later, for example once the wallet is funded, even though the seller
+answered 402. The receipt keeps what you need to check: `payer`, `nonce` and `valid_before` (Unix seconds).
 
-- Retrying with the same `intentId` is allowed, because nothing was paid. Without `team` or `authorize` the retry
-  signs the same nonce, so at most one of the two authorizations can ever move money. With `team` or `authorize`
-  the approval names the nonce: the retry signs only if it names the same nonce or the old deadline has passed,
-  and otherwise refuses with `refused_authorize` and says until when. (The team server answers a retry with
-  `released_not_expired` until that deadline in any case.)
-- A new `intentId` is a new purchase with a new nonce: only use one once you have checked the old nonce, or after
-  its deadline.
+**The deadline is not a settlement check.** Once `valid_before` has passed, the old signature can no longer be used,
+but that says nothing about whether it was used before then. The only check that shows nothing moved is
+`authorizationState(payer, nonce)` on the USDC contract on Base (`false`: never used; `true`: it settled), or the
+absence of its `AuthorizationUsed` event. This client does not read the chain, so that check is yours.
+
+- Retrying with the same `intentId` from the same wallet, network and asset is allowed, because nothing was paid.
+  Without `team` or `authorize` the retry signs the same nonce, so at most one of the two authorizations can ever
+  move money. With `team` or `authorize` the approval names the nonce: the retry signs if it names the same nonce,
+  or, with a different nonce, only once the old deadline has passed (otherwise it refuses with `refused_authorize`
+  and says until when; the team server answers `released_not_expired` until then in any case). A different nonce
+  after the deadline is not covered by the one-nonce guarantee: check `authorizationState` first.
+- A retry of that `intentId` from another wallet, on another network or for another asset throws
+  `IntentConflictError` and signs nothing: the same nonce there would be a separate authorization that could also
+  settle. So does a retry of an intent rejected by an earlier build, which did not record the payer.
+- A new `intentId` is a new purchase with a new nonce. Only start one after `authorizationState(payer, nonce)` shows
+  the old authorization unused and its deadline has passed (both: before the deadline it could still be used).
 
 ## Receipts directory
 
@@ -306,7 +313,7 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 | --- | --- | --- |
 | `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` (also: a retry after `payment_rejected` whose approval names a new nonce before the old deadline) | No |
 | `TeamRefusedError` (a `PaymentRefusedError`) | `refused_authorize`; `decision` says why | No |
-| `IntentConflictError` | `intent_conflict` | No |
+| `IntentConflictError` | `intent_conflict` (also: a retry after `payment_rejected` from another wallet, network or asset) | No |
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |
 | `SafeFetchError` | `paid_no_response` | Signed and possibly settled; `receipt.nonce` identifies it |
 | none: returned with status 402 | `receipt.outcome` `payment_rejected` | No; the authorization stays valid until `receipt.valid_before` (see "When the seller rejects the payment") |
