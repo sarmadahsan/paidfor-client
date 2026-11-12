@@ -16,8 +16,10 @@
   settle. A retry from another wallet, network or asset throws `IntentConflictError` and signs nothing (the same
   nonce there would be a second authorization that could also settle). With an approval naming a different nonce,
   the retry refuses with `refused_authorize` until the rejected authorization's deadline has passed. The deadline
-  only stops later use of the old signature; it does not show the old one was never used, which only
-  `authorizationState(payer, nonce)` on the USDC contract does. A new `intentId` signs a new nonce as before. See
+  only stops later use of the old signature; it does not show the old one was never used. `authorizationState(payer,
+  nonce)` on the USDC contract being `false` does; `true` means used or cancelled, and only the `AuthorizationUsed`
+  event with its USDC `Transfer` shows a payment. When the same nonce is signed again and rejected again, the intent
+  keeps the later of the two deadlines (an unknown one never passes). A new `intentId` signs a new nonce as before. See
   "When the seller rejects the payment" in the README.
 - New receipt field `valid_before`: the signed authorization's deadline, Unix seconds (null when nothing was signed).
   `Outcome` gains `payment_rejected`. Both are additive; older receipts lack the field.

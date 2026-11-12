@@ -93,21 +93,27 @@ seller or its facilitator) could settle it later, for example once the wallet is
 answered 402. The receipt keeps what you need to check: `payer`, `nonce` and `valid_before` (Unix seconds).
 
 **The deadline is not a settlement check.** Once `valid_before` has passed, the old signature can no longer be used,
-but that says nothing about whether it was used before then. The only check that shows nothing moved is
-`authorizationState(payer, nonce)` on the USDC contract on Base (`false`: never used; `true`: it settled), or the
-absence of its `AuthorizationUsed` event. This client does not read the chain, so that check is yours.
+but that says nothing about whether it was used before then. Read `authorizationState(payer, nonce)` on the USDC
+contract on Base: `false` after the deadline shows nothing moved and nothing ever can. `true` only says the nonce
+can no longer be used: it was used **or cancelled** (USDC's `cancelAuthorization` sets it too). To count it as a
+payment, find the `AuthorizationUsed(payer, nonce)` event and the USDC `Transfer` in the same transaction. When the
+same nonce is signed again with a shorter deadline and rejected again, the receipt's `valid_before` is that newer
+signature's; the intent file keeps the latest deadline of every signature under the nonce, and that is the one to
+wait for. This client does not read
+the chain, so that check is yours.
 
 - Retrying with the same `intentId` from the same wallet, network and asset is allowed, because nothing was paid.
   Without `team` or `authorize` the retry signs the same nonce, so at most one of the two authorizations can ever
   move money. With `team` or `authorize` the approval names the nonce: the retry signs if it names the same nonce,
   or, with a different nonce, only once the old deadline has passed (otherwise it refuses with `refused_authorize`
   and says until when; the team server answers `released_not_expired` until then in any case). A different nonce
-  after the deadline is not covered by the one-nonce guarantee: check `authorizationState` first.
+  after the deadline is not covered by the one-nonce guarantee: check `authorizationState` first (`false`).
 - A retry of that `intentId` from another wallet, on another network or for another asset throws
   `IntentConflictError` and signs nothing: the same nonce there would be a separate authorization that could also
   settle. So does a retry of an intent rejected by an earlier build, which did not record the payer.
-- A new `intentId` is a new purchase with a new nonce. Only start one after `authorizationState(payer, nonce)` shows
-  the old authorization unused and its deadline has passed (both: before the deadline it could still be used).
+- A new `intentId` is a new purchase with a new nonce. Only start one after the old deadline has passed and
+  `authorizationState(payer, nonce)` is `false` (both: before the deadline it could still be used; `true` needs the
+  `AuthorizationUsed` and `Transfer` check above to tell a payment from a cancellation).
 
 ## Receipts directory
 

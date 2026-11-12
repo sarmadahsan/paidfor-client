@@ -664,7 +664,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
             code: "intent_conflict",
             message:
               `intent ${r.intent_id} has a rejected authorization (nonce ${priorRejected.nonce}) that cannot be reused here: ${differs.join("; ")}. ` +
-              "Nothing was signed. Check on chain that the old authorization was not used (authorizationState(payer, nonce) on the USDC contract), then use a new intentId.",
+              "Nothing was signed. Check on chain that the old authorization was not used (authorizationState(payer, nonce) on the USDC contract is false; " +
+              "true means used or cancelled, and only its AuthorizationUsed event and USDC Transfer show a payment), then use a new intentId.",
           };
           return { abort: true, reason: failure.message };
         }
@@ -691,7 +692,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       // 6. A rejected authorization of this intent can still be used until its deadline. Signing its nonce again (same
       // payer, network and asset, checked above) means at most one of the two can ever move money. An approval with
       // another nonce waits for that deadline; the deadline only stops later use of the old signature and does not show
-      // that it was never used, which only authorizationState(payer, nonce) on chain can (see the README).
+      // that it was never used. authorizationState(payer, nonce) false on chain shows that; true means used or cancelled,
+      // and only the AuthorizationUsed event with its USDC Transfer shows a payment (see the README).
       if (priorRejected) {
         if (!NONCE_RE.test(priorRejected.nonce)) {
           failure = { code: "sdk", message: `intent ${r.intent_id} has a rejected authorization with an unreadable nonce; not signing again. Use a new intentId after checking the chain.` };
@@ -702,7 +704,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           const until = priorRejected.valid_before === null ? "an unknown deadline" : unixTime(priorRejected.valid_before);
           refusal = {
             code: "refused_authorize",
-            message: `refused to pay ${usd} for ${req.url}: an earlier payment for intent ${r.intent_id} (nonce ${priorRejected.nonce}) was rejected by the seller but can still be settled until ${until}, and the approval names a different nonce. Call again after that time, once authorizationState(payer, nonce) on the USDC contract shows it was not used: the deadline alone does not show that.`,
+            message: `refused to pay ${usd} for ${req.url}: an earlier payment for intent ${r.intent_id} (nonce ${priorRejected.nonce}) was rejected by the seller but can still be settled until ${until}, and the approval names a different nonce. Call again after that time, once authorizationState(payer, nonce) on the USDC contract is false (never used): the deadline alone does not show that.`,
             sellerUrl: i.seller_url,
           };
           return { abort: true, reason: refusal.message };
@@ -896,13 +898,21 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     if (res.status === 402 && (st.raw === undefined || st.parsed?.success === false)) {
       finish(r, t0, "payment_rejected");
       const why = st.parsed?.errorReason ? ` (${String(st.parsed.errorReason).slice(0, 200)})` : "";
-      const until = r.valid_before != null ? unixTime(r.valid_before) : "its deadline";
+      // The same nonce signed again keeps the LATER of the two deadlines: the seller may still hold the earlier
+      // signature, and until it lapses no other nonce may be signed. Unknown (null) on either side never passes. A
+      // different amount or pay-to on the earlier signature does not matter: one payer, one token, one nonce, so only
+      // one of the signatures under it can ever settle; the deadline is the only thing that has to be carried over.
+      const sameNonce = priorRejected !== undefined && r.nonce !== null && priorRejected.nonce.toLowerCase() === r.nonce.toLowerCase();
+      const newVb = r.valid_before ?? null;
+      const keptVb = !sameNonce ? newVb : priorRejected.valid_before === null || newVb === null ? null : Math.max(priorRejected.valid_before, newVb);
+      const until = keptVb !== null ? unixTime(keptVb) : "an unknown deadline";
       r.error = {
         code: "payment_rejected",
         message:
           `the seller answered the paid request for ${req.url} with HTTP 402${why} and settled nothing, so nothing was paid. ` +
           `The signed authorization (payer ${r.payer}, nonce ${r.nonce}) can still be used until ${until}; that deadline only ` +
-          "stops later use, and authorizationState(payer, nonce) on the USDC contract is what shows whether it was ever used. " +
+          "stops later use. authorizationState(payer, nonce) on the USDC contract is false while the nonce was never used; " +
+          "true means used or cancelled, so look for its AuthorizationUsed event and USDC Transfer before counting it as paid. " +
           `Calling again with intent ${r.intent_id} from the same wallet signs that same nonce, so at most one of the two can settle.`,
       };
       attachProof(r, undefined, st);
@@ -910,7 +920,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       try {
         await lease.update({
           phase: "rejected",
-          rejected: { nonce: r.nonce ?? "", valid_before: r.valid_before ?? null, payer: r.payer ?? "", network, asset: (r.quote?.asset ?? "").toLowerCase() },
+          rejected: { nonce: r.nonce ?? "", valid_before: keptVb, payer: r.payer ?? "", network, asset: (r.quote?.asset ?? "").toLowerCase() },
         });
       } catch (e) {
         warn(`rejected payment for intent ${r.intent_id} could not be recorded (${errMsg(e)}); a retry with this intentId will refuse rather than sign again`);

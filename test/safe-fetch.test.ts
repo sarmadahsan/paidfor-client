@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type AuthorizeRequest, type SafeFetchOptions } from "../src/index.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
@@ -345,7 +345,7 @@ describe("safeFetch: a payment the seller rejects (HTTP 402 again, nothing settl
     expect(r.payer).toBe(account.address.toLowerCase());
     expect(r.valid_before).toBeGreaterThanOrEqual(t + 50); // the seller's maxTimeoutSeconds is 60
     expect(r.error?.code).toBe("payment_rejected");
-    expect(r.error?.message).toMatch(/settled nothing, so nothing was paid.*nonce 0x[0-9a-f]{64}.*can still be used until \d{4}-.*only stops later use.*authorizationState\(payer, nonce\)/);
+    expect(r.error?.message).toMatch(/settled nothing, so nothing was paid.*nonce 0x[0-9a-f]{64}.*can still be used until \d{4}-.*only stops later use.*authorizationState\(payer, nonce\).*true means used or cancelled.*AuthorizationUsed/);
     // No price is learnt from it, and the receipt on disk says the same.
     await expect(readFile(join(dir, "prices.json"), "utf8")).rejects.toThrow();
     const [file] = await receipts();
@@ -472,6 +472,53 @@ describe("safeFetch: a payment the seller rejects (HTTP 402 again, nothing settl
       const paid = await c(`${mock.base}/x`, {}, { intentId: "ap" });
       expect(paid.receipt).toMatchObject({ outcome: "ok", paid: true, nonce: REF });
       expect(mock.st.verifyErrors).toEqual([]);
+    });
+
+    it("the same nonce rejected again keeps the later deadline, and another nonce waits for it", async () => {
+      mock.st.mode = "reject_402";
+      const now = Math.floor(Date.now() / 1000);
+      let answer = { nonce: REF as `0x${string}`, validBefore: now + 3600 };
+      const c = client({ authorize: async () => ({ approve: true, ...answer }) });
+      await c(`${mock.base}/x`, {}, { intentId: "deadlines" });
+      answer = { nonce: REF, validBefore: now + 120 };
+      const second = await c(`${mock.base}/x`, {}, { intentId: "deadlines" });
+      expect(second.receipt.valid_before).toBe(now + 120); // the receipt names the signature it sent
+      expect(JSON.parse(await readFile(intentFile("deadlines"), "utf8")).rejected.valid_before).toBe(now + 3600);
+      expect(second.receipt.error?.message).toContain(`can still be used until ${new Date((now + 3600) * 1000).toISOString()}`);
+      mock.st.mode = "ok";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        // Past the second, shorter deadline but before the first: the first signature may still settle.
+        vi.setSystemTime((now + 600) * 1000);
+        answer = { nonce: OTHER, validBefore: now + 600 + 120 };
+        const err = (await c(`${mock.base}/x`, {}, { intentId: "deadlines" }).catch((e: unknown) => e)) as PaymentRefusedError;
+        expect(err).toBeInstanceOf(PaymentRefusedError);
+        expect(err.code).toBe("refused_authorize");
+        expect(mock.st.nonces).toEqual([REF, REF]);
+        // Past the first deadline as well: another nonce may be signed.
+        vi.setSystemTime((now + 3601) * 1000);
+        answer = { nonce: OTHER, validBefore: now + 3601 + 120 };
+        const paid = await c(`${mock.base}/x`, {}, { intentId: "deadlines" });
+        expect(paid.receipt).toMatchObject({ outcome: "ok", nonce: OTHER });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("an unknown stored deadline stays unknown when the same nonce is rejected again", async () => {
+      mock.st.mode = "reject_402";
+      let nonce: `0x${string}` = REF;
+      const c = client({ authorize: async () => ({ approve: true, nonce, validBefore: later() }) });
+      await c(`${mock.base}/x`, {}, { intentId: "unknown-vb" });
+      const rec = JSON.parse(await readFile(intentFile("unknown-vb"), "utf8"));
+      rec.rejected.valid_before = null;
+      await writeFile(intentFile("unknown-vb"), JSON.stringify(rec));
+      await c(`${mock.base}/x`, {}, { intentId: "unknown-vb" });
+      expect(JSON.parse(await readFile(intentFile("unknown-vb"), "utf8")).rejected.valid_before).toBeNull();
+      mock.st.mode = "ok";
+      nonce = OTHER;
+      await expect(c(`${mock.base}/x`, {}, { intentId: "unknown-vb" })).rejects.toBeInstanceOf(PaymentRefusedError);
+      expect(mock.st.nonces).toEqual([REF, REF]);
     });
 
     it("once the rejected authorization's deadline has passed, a new nonce is signed", async () => {
