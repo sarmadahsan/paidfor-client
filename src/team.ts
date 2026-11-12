@@ -19,10 +19,26 @@ import type { Receipt } from "./receipt.js";
 export const TEAM_ORIGIN = "https://paidfor.dev";
 export const AUTHORIZE_TIMEOUT_MS = 10_000;
 export const REPORT_TIMEOUT_MS = 5_000;
+/** How long a refusal notice may take. Never awaited by a payment. */
+export const REFUSAL_TIMEOUT_MS = 2_000;
 /** The words the server takes for a paid outcome. */
 const PAID_OUTCOMES = ["ok", "non_delivery", "wrong_goods", "overcharge", "duplicate", "paid_no_response"];
 /** Shown when the team does not know the wallet. */
-const MCP_INIT = "npx -y @paidfor/mcp@0.7.0 init --wallet --link";
+const MCP_INIT = "npx -y @paidfor/mcp@latest init --wallet --link";
+
+/**
+ * The server's rule for a project tag (paidfor lib/team/project.ts): trimmed, then 1 to 64 letters, digits, spaces or
+ * . _ -. A tag the server would refuse is refused here, when the client is made, instead of on every payment.
+ */
+const PROJECT_RE = /^[A-Za-z0-9._ -]{1,64}$/;
+export const PROJECT_RULE = 'a project tag is 1 to 64 letters, digits, spaces or . _ - (for example "research-q4")';
+
+/** The tag made canonical (trimmed), or null when the server would refuse it. */
+export function cleanProject(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return PROJECT_RE.test(t) ? t : null;
+}
 
 /** `team` in SafeFetchOptions. */
 export interface TeamOptions {
@@ -34,6 +50,12 @@ export interface TeamOptions {
   authorizeTimeoutMs?: number;
   /** How long each outcome report may take. Default 5000 ms. */
   reportTimeoutMs?: number;
+  /**
+   * A project tag sent with every authorize (and refusal notice), so the ledger and the bill can be read by project.
+   * 1 to 64 letters, digits, spaces or . _ - after trimming; anything else throws when the client is made. When team
+   * mode comes from PAIDFOR_TEAM_KEY, PAIDFOR_PROJECT is read instead.
+   */
+  project?: string;
 }
 
 /** A notice a newer server may attach to a decision, such as a budget nearly used up. */
@@ -63,7 +85,11 @@ export type TeamDecision = (
 ) &
   TeamDecisionExtras;
 
-export type TeamAuthorizeBody = { wallet: string; intent_id: string; resource_url: string; pay_to: string; amount_atomic: string; network: string; asset: string; scheme: string; protocol: "x402" };
+export type TeamAuthorizeBody = { wallet: string; intent_id: string; resource_url: string; pay_to: string; amount_atomic: string; network: string; asset: string; scheme: string; protocol: "x402"; project?: string };
+
+/** What the client refused by itself, before asking the team (`POST /v1/team/refusals`). */
+export type TeamRefusalReason = "refused_verdict" | "refused_ratio" | "refused_max_per_call";
+export type TeamRefusalBody = Omit<TeamAuthorizeBody, "project"> & { reason: TeamRefusalReason; verdict?: "avoid" | "caution" | "ok" | "unknown"; project?: string };
 
 export type TeamOutcomeBody = { wallet: string; intent_id: string; auth_ref: string; paid: boolean; settlement_ref?: string; outcome?: string; http_status?: number; response_sha256?: string };
 
@@ -257,6 +283,22 @@ export class TeamClient {
       /* an unreadable body is handled below */
     }
     return res.status === 200 ? readDecision(parsed) : failedStatus(res.status, parsed, body.wallet, this.origin);
+  }
+
+  /**
+   * Tell the team about a payment this client refused before asking it, so the ledger and the bill can count what was
+   * saved. Fire-and-forget: one try, a 2 s timeout, every failure (a 404 from a server without the route included)
+   * swallowed and never logged. Never throws or rejects; the promise is returned only so tests can wait on it.
+   */
+  reportRefusal(body: TeamRefusalBody): Promise<void> {
+    try {
+      return this.post("/v1/team/refusals", body, REFUSAL_TIMEOUT_MS).then(
+        (res) => void res.body?.cancel().catch(() => undefined),
+        () => undefined,
+      ).catch(() => undefined);
+    } catch {
+      return Promise.resolve();
+    }
   }
 
   /** One try. "retry" means the server could not take it now; a 4xx will never be taken, so it is not kept. */

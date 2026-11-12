@@ -17,7 +17,7 @@ export function fixture(name: string): unknown {
   return JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8"));
 }
 
-export type SellerMode = "ok" | "conway_500" | "big" | "hang" | "offnet" | "free" | "settle_fail";
+export type SellerMode = "ok" | "conway_500" | "big" | "hang" | "offnet" | "free" | "settle_fail" | "reject_402" | "reject_garbled";
 export type IndexMode = { kind: "json"; body: unknown } | { kind: "status"; status: number } | { kind: "hang" };
 
 export interface MockState {
@@ -26,6 +26,8 @@ export interface MockState {
   unpaidCount: number;
   paidCount: number;
   verifyErrors: string[];
+  /** The authorization nonce of every paid request, in order. */
+  nonces: string[];
   index: IndexMode;
   indexCalls: string[];
   telemetryStatus: number | "hang";
@@ -41,6 +43,7 @@ export function freshState(): MockState {
     unpaidCount: 0,
     paidCount: 0,
     verifyErrors: [],
+    nonces: [],
     index: { kind: "status", status: 503 },
     indexCalls: [],
     telemetryStatus: 404,
@@ -92,6 +95,7 @@ async function checkPayment(st: MockState, header: string): Promise<{ payer: str
   });
   if (!valid) errs.push("signature");
   st.verifyErrors.push(...errs);
+  st.nonces.push(a.nonce);
   return { payer: a.from };
 }
 
@@ -153,6 +157,16 @@ async function handler(st: MockState, req: IncomingMessage, res: ServerResponse)
       return;
     case "settle_fail":
       res.writeHead(402, { [HEADERS.V2_RESPONSE]: encodeHeaderJson({ success: false, transaction: "", network: NETWORK, errorReason: "insufficient_funds" }) });
+      res.end("{}");
+      return;
+    case "reject_402":
+      // An empty wallet: the facilitator cannot settle, so the seller asks to be paid again and settles nothing.
+      res.writeHead(402, { [HEADERS.V2_REQUIRED]: encodeHeaderJson(envelope(st, `http://test${req.url}`)), "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "insufficient_funds" }));
+      return;
+    case "reject_garbled":
+      // A 402 with a settlement header nobody can read: it might name a settlement, so it is not taken as a rejection.
+      res.writeHead(402, { [HEADERS.V2_RESPONSE]: "%%%not-base64%%%", "content-type": "application/json" });
       res.end("{}");
       return;
     case "big": {

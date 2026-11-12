@@ -7,4 +7,4 @@ export type { ValidatorResult } from "./validators/types.js";
 export type { TelemetryPayload, TelemetryPayloadV2 } from "./telemetry.js";
 export type { TelemetryProof, TelemetryOutcome } from "./proof.js";
 export { reportOnly, withPaidforReporting, withPaidforReportingAxios, buildTxOnlyPayload, settlementTx, type ReportOnlyOptions, type ReportOutcome, type TxOnlyPayload, type AxiosLike } from "./report-only.js";
-export { TeamClient, outcomeFor, readDecision, isKeySafeOrigin, TEAM_ORIGIN, type TeamOptions, type TeamDecision, type TeamDecisionExtras, type TeamWarning, type TeamReceipt, type TeamReportState, type TeamAuthorizeBody, type TeamOutcomeBody, type TeamClientOptions } from "./team.js";
+export { TeamClient, outcomeFor, readDecision, isKeySafeOrigin, cleanProject, TEAM_ORIGIN, type TeamOptions, type TeamRefusalBody, type TeamRefusalReason, type TeamDecision, type TeamDecisionExtras, type TeamWarning, type TeamReceipt, type TeamReportState, type TeamAuthorizeBody, type TeamOutcomeBody, type TeamClientOptions } from "./team.js";

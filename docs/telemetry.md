@@ -19,7 +19,7 @@ No account and no key are needed to send it.
   "amount_usdc": "0.010000",
   "latency_ms": 412,
   "validator_failures": [],
-  "client": "x402-safe-fetch/0.3.0"
+  "client": "x402-safe-fetch/<version>"
 }
 ```
 
@@ -32,7 +32,7 @@ No account and no key are needed to send it.
 | `amount_usdc` | Amount of the signed authorization as a 6-decimal string. `"0.000000"` when nothing was signed. |
 | `latency_ms` | Wall time of the call in milliseconds, rounded. |
 | `validator_failures` | Names of the validators that failed, for example `["http_status"]`. Names only, no evidence. |
-| `client` | `x402-safe-fetch/<version>`, `x402-safe-fetch/0.3.0` for this version. |
+| `client` | `x402-safe-fetch/<version>`, for example `x402-safe-fetch/0.6.0`. |
 
 ## What is never sent (v1)
 
@@ -42,7 +42,9 @@ No account and no key are needed to send it.
 - The `intentId`, the request hash, or anything that links two calls together.
 - Validator evidence, error messages, or seller response text.
 
-Calls to free resources (no 402) and replays of a stored intent send nothing.
+Calls to free resources (no 402) and replays of a stored intent send nothing. Nor does a payment the seller
+rejected (receipt outcome `payment_rejected`, from 0.6.0: the paid request answered 402 again and nothing settled),
+in either version: nothing was paid, and the row would otherwise read as a failure of the seller.
 
 ## How it is sent
 
@@ -74,7 +76,7 @@ Additive over v1. `v` is `2`, `outcome` uses the harness names, `validator_failu
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.3.0",
+  "client": "x402-safe-fetch/<version>",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -104,7 +106,7 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | v2 outcome | When |
 | --- | --- |
 | `duplicate` | More than one settlement observed for one intent. The client sends one paid request per intent, so in practice it never sees this. |
-| `error` | The settlement header says `success: false` and the answer was not 2xx: the seller rejected the payment (the harness's `not_paid`). Proof is still sent, so the index can confirm nothing moved. |
+| `error` | The settlement header says `success: false` and the answer was neither 2xx nor 402: the seller rejected the payment (the harness's `not_paid`). Proof is still sent, so the index can confirm nothing moved. A 402 with no settlement, or with `success: false`, is `payment_rejected` on the receipt and sends no row (0.6.0). |
 | `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. |
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
@@ -133,7 +135,7 @@ settled payment; the v2 row adds the link from that payment to the seller host, 
 failures and response hash. Bodies, request parameters, headers, the intent id and validator evidence are never
 sent in either version. `"verified"` requires an https `indexUrl` (loopback excepted), and no telemetry request
 follows a redirect. Each receipt stores the same `proof` and, in `"verified"` mode,
-`verification_url` = `{indexUrl}/telemetry/<payer>/<nonce>` (404 until the index serves that route).
+`verification_url` = `{indexUrl}/telemetry/<payer>/<nonce>`, which shows whether the index verified the row.
 
 ## tx_only (report-only)
 
@@ -151,7 +153,7 @@ Base settlement header, one object goes to `POST {indexUrl}/telemetry` (default 
   "outcome": "ok",
   "latency_ms": 412,
   "validator_failures": [],
-  "client": "x402-safe-fetch/0.3.0",
+  "client": "x402-safe-fetch/<version>",
   "proof": { "network": "eip155:8453", "tx_hash": "0x<settlement transaction hash>" }
 }
 ```
@@ -168,7 +170,7 @@ Base settlement header, one object goes to `POST {indexUrl}/telemetry` (default 
 No payer, pay-to, nonce, amount or signature is sent: the index reads the payer, the recipient and the amount from the
 transaction on Base, and the report counts only once that transaction is a USDC transfer to the seller. The index
 answers `verified`, `pending` or a 422 with the reason; one transaction is one row across every channel. The request
-carries `X-Paidfor-Client: x402-safe-fetch/0.3.0`, waits up to 10 seconds (the index checks the chain before
+carries `X-Paidfor-Client: x402-safe-fetch/<version>`, waits up to 10 seconds (the index checks the chain before
 answering), never follows a redirect, and needs an https `indexUrl` (loopback excepted). Failures are counted in
 `<receiptsDir>/debug.log` when you pass a `receiptsDir`, otherwise nowhere. The same row is what the paidfor MCP tool
 `report_x402_payment` and the paidfor skill send.

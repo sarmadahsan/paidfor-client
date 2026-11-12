@@ -315,15 +315,127 @@ describe("safeFetch: idempotency", () => {
     expect(mock.st.paidCount).toBe(1);
   });
 
-  it("the seller's own 402 after payment is stored and replayed, not re-signed", async () => {
-    mock.st.mode = "settle_fail";
+  it("a 402 with a settlement header that cannot be read is kept as paid and replayed, not re-signed", async () => {
+    mock.st.mode = "reject_garbled";
     const f = client();
-    const a = await f(`${mock.base}/data`, {}, { intentId: "s" });
+    const a = await f(`${mock.base}/data`, {}, { intentId: "g" });
     expect(a.status).toBe(402);
-    expect(a.receipt.validators.http_status).toMatchObject({ status: "fail", reason: "payment_rejected" });
-    const b = await f(`${mock.base}/data`, {}, { intentId: "s" });
+    expect(a.receipt).toMatchObject({ outcome: "validator_failed", paid: true });
+    expect(a.receipt.settlement.parse_error).toBeTruthy();
+    const b = await f(`${mock.base}/data`, {}, { intentId: "g" });
     expect(b.receipt.replayed).toBe(true);
     expect(mock.st.paidCount).toBe(1);
+  });
+});
+
+describe("safeFetch: a payment the seller rejects (HTTP 402 again, nothing settled)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 200));
+  const intentFile = (id: string) => join(dir, "intents", `${createHash("sha256").update(id).digest("hex").slice(0, 40)}.json`);
+
+  it.each(["reject_402", "settle_fail"] as const)("%s: not paid, says so, keeps the nonce and deadline, and records no price", async (mode) => {
+    mock.st.mode = mode;
+    const t = Math.floor(Date.now() / 1000);
+    const res = await client()(`${mock.base}/data`, {}, { intentId: "empty-wallet" });
+    expect(res.status).toBe(402);
+    const r = res.receipt;
+    expect(r).toMatchObject({ outcome: "payment_rejected", paid: false, tx_hash: null, proof: null, verification_url: null, reported_outcome: "error", amount_usdc: "0.010000" });
+    expect(r.validators.http_status).toMatchObject({ status: "fail", reason: "payment_rejected" });
+    expect(r.nonce).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(r.nonce).toBe(mock.st.nonces[0]);
+    expect(r.payer).toBe(account.address.toLowerCase());
+    expect(r.valid_before).toBeGreaterThanOrEqual(t + 50); // the seller's maxTimeoutSeconds is 60
+    expect(r.error?.code).toBe("payment_rejected");
+    expect(r.error?.message).toMatch(/settled nothing, so nothing was paid.*nonce 0x[0-9a-f]{64}.*could still be settled until \d{4}-/);
+    // No price is learnt from it, and the receipt on disk says the same.
+    await expect(readFile(join(dir, "prices.json"), "utf8")).rejects.toThrow();
+    const [file] = await receipts();
+    expect(JSON.parse(await readFile(join(dir, file!), "utf8"))).toMatchObject({ outcome: "payment_rejected", paid: false, nonce: r.nonce, valid_before: r.valid_before });
+    expect(JSON.parse(await readFile(intentFile("empty-wallet"), "utf8"))).toMatchObject({ phase: "rejected", rejected: { nonce: r.nonce, valid_before: r.valid_before } });
+  });
+
+  it.each(["anonymous", "verified"] as const)("sends no %s telemetry row", async (telemetry) => {
+    mock.st.mode = "reject_402";
+    await client({ telemetry })(`${mock.base}/data`);
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("a retry with the same intentId signs the same nonce, pays once funded, then replays", async () => {
+    mock.st.mode = "reject_402";
+    const f = client();
+    const first = await f(`${mock.base}/data`, {}, { intentId: "fund-later" });
+    const again = await f(`${mock.base}/data`, {}, { intentId: "fund-later" });
+    expect(again.receipt.outcome).toBe("payment_rejected");
+    mock.st.mode = "ok";
+    const paid = await f(`${mock.base}/data`, {}, { intentId: "fund-later" });
+    expect(paid.receipt).toMatchObject({ outcome: "ok", paid: true, tx_hash: TX, nonce: first.receipt.nonce });
+    expect(mock.st.verifyErrors).toEqual([]);
+    expect(mock.st.nonces).toEqual([first.receipt.nonce, first.receipt.nonce, first.receipt.nonce]);
+    // Once paid, the intent is done: a fourth call is a replay and the seller is not asked.
+    const replay = await f(`${mock.base}/data`, {}, { intentId: "fund-later" });
+    expect(replay.receipt.replayed).toBe(true);
+    expect(mock.st.paidCount).toBe(3);
+    // The price is learnt from the payment that settled.
+    expect(Object.values(JSON.parse(await readFile(join(dir, "prices.json"), "utf8")))).toHaveLength(1);
+  });
+
+  it("the nonce survives a restart and a refused attempt in between", async () => {
+    mock.st.mode = "reject_402";
+    const first = await client()(`${mock.base}/data`, {}, { intentId: "restart" });
+    mock.st.mode = "ok";
+    await expect(client({ maxPerCallUsd: 0.001 })(`${mock.base}/data`, {}, { intentId: "restart" })).rejects.toBeInstanceOf(PaymentRefusedError);
+    const paid = await client()(`${mock.base}/data`, {}, { intentId: "restart" });
+    expect(paid.receipt.nonce).toBe(first.receipt.nonce);
+    expect(mock.st.nonces).toEqual([first.receipt.nonce, first.receipt.nonce]);
+  });
+
+  it("a new intentId signs a new nonce", async () => {
+    mock.st.mode = "reject_402";
+    const f = client();
+    await f(`${mock.base}/data`, {}, { intentId: "a" });
+    await f(`${mock.base}/data`, {}, { intentId: "b" });
+    expect(new Set(mock.st.nonces).size).toBe(2);
+  });
+
+  describe("with authorize", () => {
+    const REF = `0x${"7a".repeat(32)}` as const;
+    const OTHER = `0x${"7b".repeat(32)}` as const;
+    const later = () => Math.floor(Date.now() / 1000) + 120;
+
+    it("an approval naming another nonce is refused while the rejected one can still settle", async () => {
+      mock.st.mode = "reject_402";
+      let nonce: `0x${string}` = REF;
+      const c = client({ authorize: async () => ({ approve: true, nonce, validBefore: later() }) });
+      const first = await c(`${mock.base}/x`, {}, { intentId: "ap" });
+      expect(first.receipt).toMatchObject({ outcome: "payment_rejected", paid: false, nonce: REF });
+      mock.st.mode = "ok";
+      nonce = OTHER;
+      const err = (await c(`${mock.base}/x`, {}, { intentId: "ap" }).catch((e: unknown) => e)) as PaymentRefusedError;
+      expect(err).toBeInstanceOf(PaymentRefusedError);
+      expect(err.code).toBe("refused_authorize");
+      expect(err.message).toMatch(/rejected by the seller but can still be settled until .*Call again after that time/);
+      expect(mock.st.paidCount).toBe(1);
+      // The same nonce is fine: only one of the two can ever be used.
+      nonce = REF;
+      const paid = await c(`${mock.base}/x`, {}, { intentId: "ap" });
+      expect(paid.receipt).toMatchObject({ outcome: "ok", paid: true, nonce: REF });
+      expect(mock.st.verifyErrors).toEqual([]);
+    });
+
+    it("once the rejected authorization's deadline has passed, a new nonce is signed", async () => {
+      mock.st.mode = "reject_402";
+      let nonce: `0x${string}` = REF;
+      const c = client({ authorize: async () => ({ approve: true, nonce, validBefore: later() }) });
+      await c(`${mock.base}/x`, {}, { intentId: "lapsed" });
+      const rec = JSON.parse(await readFile(intentFile("lapsed"), "utf8"));
+      rec.rejected.valid_before = Math.floor(Date.now() / 1000) - 1;
+      await writeFile(intentFile("lapsed"), JSON.stringify(rec));
+      mock.st.mode = "ok";
+      nonce = OTHER;
+      const paid = await c(`${mock.base}/x`, {}, { intentId: "lapsed" });
+      expect(paid.receipt).toMatchObject({ outcome: "ok", paid: true, nonce: OTHER });
+      expect(mock.st.nonces).toEqual([REF, OTHER]);
+    });
   });
 });
 
@@ -352,7 +464,7 @@ describe("safeFetch: telemetry", () => {
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.5.0" });
+    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.6.0" });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
     for (const leak of ["secret", "abc", "tel-1", account.address.toLowerCase().slice(2), account.address.slice(2)]) expect(raw).not.toContain(leak);
@@ -506,6 +618,23 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
     client({ telemetry: "anonymous" });
     expect(warnings).toHaveLength(1);
+  });
+
+  it("telemetryNotice: false never shows the notice; a function receives it instead of the logger", async () => {
+    client({ telemetry: "verified", telemetryNotice: false });
+    await settle();
+    expect(warnings).toEqual([]);
+    await expect(readFile(join(dir, ".verified-telemetry-notice"), "utf8")).rejects.toThrow();
+    const got: string[] = [];
+    client({ telemetry: "verified", telemetryNotice: (m) => got.push(m) });
+    await settle();
+    expect(warnings).toEqual([]);
+    expect(got).toHaveLength(1);
+    expect(got[0]).toMatch(/^x402-safe-fetch: telemetry: "verified" sends .*Shown once\.$/);
+    // Shown once per directory either way.
+    client({ telemetry: "verified" });
+    await settle();
+    expect(warnings).toEqual([]);
   });
 
   it('refuses a plain-http remote indexUrl with "verified", allows loopback and https', () => {

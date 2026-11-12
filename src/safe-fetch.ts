@@ -22,7 +22,7 @@ import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
 import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
 import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
-import { TEAM_ORIGIN, TeamClient, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt } from "./team.js";
+import { PROJECT_RULE, TEAM_ORIGIN, TeamClient, cleanProject, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt, type TeamRefusalReason } from "./team.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
 import { CLIENT_ID, buildPayload, buildPayloadV2, sendTelemetry } from "./telemetry.js";
 import { runAllValidators, validatorsByName } from "./validators/index.js";
@@ -71,6 +71,12 @@ export interface SafeFetchOptions {
   /** Where "caution" verdicts and non-fatal local write failures are reported. Default console. */
   logger?: { warn(msg: string): void };
   /**
+   * The one-time notice that says what `telemetry: "verified"` sends. Default true: it goes to `logger.warn` (stderr
+   * with the default console). `false` never shows it; a function receives the text instead of `logger`. Useful in
+   * an MCP server, whose client may show anything on stderr as an error.
+   */
+  telemetryNotice?: boolean | ((msg: string) => void);
+  /**
    * Asks someone else whether this payment may go ahead, after every local check has passed and before anything is
    * signed. An approval names the EIP-3009 nonce and `validBefore` to sign. Anything but a well-formed approval,
    * including a throw, is a `refused_authorize`: nothing is signed. Not asked for a free resource or a replay.
@@ -81,10 +87,12 @@ export interface SafeFetchOptions {
    * Team mode: a paidfor team account's budgets, approvals and ledger. Before signing, every payment asks
    * `{origin}/v1/team/authorize` with the key and signs the nonce and deadline the team minted; anything but a clean
    * approval pays nothing and throws TeamRefusedError. Every approval's outcome is reported to `/v1/team/outcome`; a
-   * report the server could not take is kept in `<receiptsDir>/team-outcomes` and sent before the next payment.
+   * report the server could not take is kept in `<receiptsDir>/team-outcomes` and sent before the next payment. A payment
+   * refused locally before the team is asked (verdict, ratio, per-call cap) is told to `/v1/team/refusals`,
+   * fire-and-forget. `project` tags every payment.
    *
    * When omitted (and `authorize` is not set), the key is read from the environment variable PAIDFOR_TEAM_KEY if it
-   * is set. `false` turns team mode off whatever the environment says. Passing `team` together with `authorize` throws.
+   * is set, and the project tag from PAIDFOR_PROJECT. `false` turns team mode off whatever the environment says. Passing `team` together with `authorize` throws.
    */
   team?: TeamOptions | false;
 }
@@ -109,7 +117,11 @@ export type AuthorizeAnswer =
 const MIN_AUTH_SECONDS_LEFT = 10;
 
 export interface CallOptions {
-  /** Same intentId + same request: returns the stored result, never signs again. Same intentId + different request: throws. */
+  /**
+   * Same intentId + same request: returns the stored result, never signs again. Same intentId + different request: throws.
+   * After a `payment_rejected` the same intentId may be used again; it signs the rejected authorization's nonce again,
+   * so at most one of the two can ever settle.
+   */
   intentId?: string;
 }
 
@@ -179,20 +191,37 @@ const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
 let envNoticeShown = false;
 
-/** `team`, or PAIDFOR_TEAM_KEY when neither `team` nor `authorize` is given. */
-function resolveTeam(o: SafeFetchOptions): { team: TeamOptions; fromEnv: boolean } | undefined {
+/** A project tag as the server takes it, or a TypeError naming where the bad one came from. */
+function projectTag(v: unknown, from: string): string {
+  const p = cleanProject(v);
+  if (p === null) throw new TypeError(`safeFetch: ${from} ${JSON.stringify(v)} is not a project tag: ${PROJECT_RULE}`);
+  return p;
+}
+
+/** `team`, or PAIDFOR_TEAM_KEY (and PAIDFOR_PROJECT) when neither `team` nor `authorize` is given. */
+function resolveTeam(o: SafeFetchOptions): { team: TeamOptions; fromEnv: boolean; project: string | undefined } | undefined {
   if (o.team === false) return undefined;
   if (o.team !== undefined) {
     if (!o.team || typeof o.team !== "object" || typeof o.team.key !== "string" || !o.team.key.trim()) {
-      throw new TypeError("safeFetch: team must be { key: string, origin?: string } or false");
+      throw new TypeError("safeFetch: team must be { key: string, origin?: string, project?: string } or false");
     }
     if (o.authorize) throw new TypeError("safeFetch: pass team or authorize, not both (team supplies its own authorize)");
-    return { team: o.team, fromEnv: false };
+    const project = o.team.project === undefined ? undefined : projectTag(o.team.project, "team.project");
+    return { team: o.team, fromEnv: false, project };
   }
   if (o.authorize) return undefined; // the caller asks someone itself; the environment is not consulted
-  const key = typeof process !== "undefined" ? process.env?.PAIDFOR_TEAM_KEY?.trim() : undefined;
-  return key ? { team: { key }, fromEnv: true } : undefined;
+  const env = typeof process !== "undefined" ? process.env : undefined;
+  const key = env?.PAIDFOR_TEAM_KEY?.trim();
+  if (!key) return undefined;
+  // An empty PAIDFOR_PROJECT is the same as none; anything else must be a tag the server takes.
+  const rawProject = env?.PAIDFOR_PROJECT;
+  const project = rawProject === undefined || !rawProject.trim() ? undefined : projectTag(rawProject, "PAIDFOR_PROJECT");
+  return { team: { key }, fromEnv: true, project };
 }
+
+/** Refusals the client makes by itself before the team is asked; the team is told about them (POST /v1/team/refusals). */
+const LOCAL_REFUSALS: ReadonlySet<string> = new Set<TeamRefusalReason>(["refused_verdict", "refused_ratio", "refused_max_per_call"]);
+const NONCE_RE = /^0x[0-9a-fA-F]{64}$/;
 
 function teamReceipt(origin: string, d: TeamDecision): TeamReceipt {
   return {
@@ -275,7 +304,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     }
   };
 
-  if (telemetry === "verified") void verifiedNotice();
+  const noticeOpt = options.telemetryNotice ?? true;
+  if (telemetry === "verified" && noticeOpt !== false) void verifiedNotice();
 
   const team = teamConf
     ? new TeamClient({
@@ -302,12 +332,18 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     } catch {
       /* first run */
     }
-    warn(
+    const text =
       'telemetry: "verified" sends each purchase outcome with its proof of payment (payer address, nonce, pay-to, tx hash) ' +
-        `to ${indexUrl}/telemetry so the index can check it on Base. No bodies, request parameters, IP or identity. ` +
-        'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why ' +
-        '(set telemetry: "anonymous" or "off" to change it). Shown once.',
-    );
+      `to ${indexUrl}/telemetry so the index can check it on Base. No bodies, request parameters, IP or identity. ` +
+      'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why ' +
+      '(set telemetry: "anonymous" or "off" to change it). Shown once.';
+    if (typeof noticeOpt === "function") {
+      try {
+        noticeOpt(`x402-safe-fetch: ${text}`);
+      } catch {
+        /* ignore */
+      }
+    } else warn(text);
     try {
       await mkdir(receiptsDir, { recursive: true });
       await writeFile(marker, `${new Date().toISOString()}\n`);
@@ -328,6 +364,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
 
   function emitTelemetry(r: Receipt) {
     if (telemetry === "off" || !indexUrl) return;
+    // Nothing was paid and the seller is not at fault for a wallet that cannot pay; the contract has no outcome for it.
+    if (r.outcome === "payment_rejected") return;
     try {
       const payload =
         telemetry === "verified"
@@ -413,6 +451,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       tx_hash: null,
       nonce: null,
       payer: null,
+      valid_before: null,
       proof: null,
       reported_outcome: null,
       verification_url: null,
@@ -452,6 +491,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       r.tx_hash = original.tx_hash;
       r.nonce = original.nonce;
       r.payer = original.payer ?? null;
+      r.valid_before = original.valid_before ?? null;
       r.proof = original.proof ?? null;
       r.reported_outcome = original.reported_outcome ?? null;
       r.verification_url = original.verification_url ?? null;
@@ -471,7 +511,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     let quote: NormalizedRequirements | undefined;
     let approved: bigint | undefined;
     let refusal: { code: "refused_verdict" | "refused_ratio" | "refused_max_per_call" | "refused_authorize"; message: string; sellerUrl: string | null } | undefined;
-    let auth: { nonce: `0x${string}`; validBefore: bigint } | undefined;
+    // The nonce (and, from an approval, the deadline) to sign instead of the SDK's own.
+    let auth: { nonce: `0x${string}`; validBefore?: bigint } | undefined;
+    // An earlier attempt of this intent was signed and rejected; that authorization may still be settled until its deadline.
+    const priorRejected = lease.record.rejected;
     let authSigned = false;
     let failure: { code: SafeFetchErrorCode; message: string } | undefined;
     let signingStarted = false;
@@ -500,19 +543,22 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           q.asset.toLowerCase() === usdc &&
           ((q.extra?.assetTransferMethod as string | undefined) ?? "eip3009") === "eip3009",
       );
-    // With `authorize` the approval decides the nonce and deadline; the SDK has no way to take them, so they are set
-    // here at signing and on the signed payload in onAfterPaymentCreation.
-    const schemeSigner: ClientEvmSigner = !authorize
-      ? signer
-      : {
-          address: signer.address,
-          signTypedData: async (m) => {
-            if (!auth || m.primaryType !== "TransferWithAuthorization") throw new Error("x402-safe-fetch: refusing to sign without an approval");
-            const signature = await signer.signTypedData({ ...m, message: { ...m.message, nonce: auth.nonce, validBefore: auth.validBefore } });
-            authSigned = true;
-            return signature;
-          },
-        };
+    // With `authorize` the approval decides the nonce and deadline; after a rejected payment the old nonce is signed
+    // again. The SDK has no way to take either, so they are set here at signing and on the signed payload in
+    // onAfterPaymentCreation.
+    const schemeSigner: ClientEvmSigner =
+      !authorize && !priorRejected
+        ? signer
+        : {
+            address: signer.address,
+            signTypedData: async (m) => {
+              if (!auth || m.primaryType !== "TransferWithAuthorization") throw new Error("x402-safe-fetch: refusing to sign without an approval");
+              const message = { ...m.message, nonce: auth.nonce, ...(auth.validBefore !== undefined ? { validBefore: auth.validBefore } : {}) };
+              const signature = await signer.signTypedData({ ...m, message });
+              authSigned = true;
+              return signature;
+            },
+          };
     registerExactEvmScheme(client, { signer: schemeSigner, networks: [network], policies: [policy] });
 
     client.onBeforePaymentCreation(async ({ paymentRequired, selectedRequirements }) => {
@@ -617,6 +663,25 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         auth = { nonce: answer.nonce, validBefore: BigInt(answer.validBefore) };
       }
 
+      // 5. A rejected authorization of this intent may still be settled until its deadline. Signing its nonce again
+      // means at most one of the two can ever move money; an approval with another nonce waits for that deadline.
+      if (priorRejected) {
+        if (!NONCE_RE.test(priorRejected.nonce)) {
+          failure = { code: "sdk", message: `intent ${r.intent_id} has a rejected authorization with an unreadable nonce; not signing again. Use a new intentId after checking the chain.` };
+          return { abort: true, reason: failure.message };
+        }
+        if (!auth) auth = { nonce: priorRejected.nonce as `0x${string}` };
+        else if (auth.nonce.toLowerCase() !== priorRejected.nonce.toLowerCase() && (priorRejected.valid_before === null || priorRejected.valid_before > Date.now() / 1000)) {
+          const until = priorRejected.valid_before === null ? "an unknown deadline" : unixTime(priorRejected.valid_before);
+          refusal = {
+            code: "refused_authorize",
+            message: `refused to pay ${usd} for ${req.url}: an earlier payment for intent ${r.intent_id} (nonce ${priorRejected.nonce}) was rejected by the seller but can still be settled until ${until}, and the approval names a different nonce. Call again after that time.`,
+            sellerUrl: i.seller_url,
+          };
+          return { abort: true, reason: refusal.message };
+        }
+      }
+
       approved = amount;
       try {
         await lease.update({ phase: "signing", amount_atomic: amount.toString(), pay_to: norm.payTo });
@@ -651,9 +716,11 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           throw new Error(failure.message);
         }
         a.nonce = auth.nonce;
-        a.validBefore = auth.validBefore.toString();
+        if (auth.validBefore !== undefined) a.validBefore = auth.validBefore.toString();
       }
       r.nonce = String(a.nonce);
+      const vb = Number(a.validBefore);
+      r.valid_before = Number.isSafeInteger(vb) ? vb : null;
       r.payer = String(a.from).toLowerCase();
       r.amount_usdc = atomicToUsdc(BigInt(value));
       try {
@@ -792,9 +859,34 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       return wrapResponse(res.status, res.statusText, res.headers, read.callerBody, res.url || req.url, r);
     }
 
-    r.paid = true;
     const st = decodeSettlementHeader(record.headers);
     r.settlement = { header: st.raw ?? null, version: st.version ?? null, parsed: st.parsed ?? null, parse_error: st.parseError ?? null };
+
+    // The seller answered the paid request with another 402 and settled nothing (no settlement header, or one saying
+    // it failed): an empty wallet, an expired or refused authorization. Nothing was paid. An unreadable header is not
+    // taken as a rejection, since it may name a settlement.
+    if (res.status === 402 && (st.raw === undefined || st.parsed?.success === false)) {
+      finish(r, t0, "payment_rejected");
+      const why = st.parsed?.errorReason ? ` (${String(st.parsed.errorReason).slice(0, 200)})` : "";
+      const until = r.valid_before != null ? unixTime(r.valid_before) : "its deadline";
+      r.error = {
+        code: "payment_rejected",
+        message:
+          `the seller answered the paid request for ${req.url} with HTTP 402${why} and settled nothing, so nothing was paid. ` +
+          `The signed authorization (payer ${r.payer}, nonce ${r.nonce}) could still be settled until ${until}. ` +
+          `Calling again with intent ${r.intent_id} signs that same nonce, so at most one payment can ever settle.`,
+      };
+      attachProof(r, undefined, st);
+      await persistReceipt(r);
+      try {
+        await lease.update({ phase: "rejected", rejected: { nonce: r.nonce ?? "", valid_before: r.valid_before ?? null } });
+      } catch (e) {
+        warn(`rejected payment for intent ${r.intent_id} could not be recorded (${errMsg(e)}); a retry with this intentId will refuse rather than sign again`);
+      }
+      return wrapResponse(res.status, res.statusText, res.headers, read.callerBody, res.url || req.url, r);
+    }
+
+    r.paid = true;
     const tx = st.parsed?.transaction;
     r.tx_hash = typeof tx === "string" && TX_HASH_RE.test(tx) ? tx : null;
     finish(r, t0, r.validator_failures.length ? "validator_failed" : "ok");
@@ -841,9 +933,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
 
   /** live() with the team asked before signing, and every approval's outcome reported after. */
   async function teamLive(team: TeamClient, lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+    const project = teamConf?.project;
     let decision: TeamDecision | undefined;
     const authorize = async (q: AuthorizeRequest): Promise<AuthorizeAnswer> => {
-      const d = await team.authorize({ wallet: q.payer, intent_id: q.intentId, resource_url: q.url, pay_to: q.payTo, amount_atomic: q.amountAtomic, network: q.network, asset: q.asset, scheme: q.scheme, protocol: "x402" });
+      const d = await team.authorize({ wallet: q.payer, intent_id: q.intentId, resource_url: q.url, pay_to: q.payTo, amount_atomic: q.amountAtomic, network: q.network, asset: q.asset, scheme: q.scheme, protocol: "x402", ...(project ? { project } : {}) });
       decision = d;
       r.team = teamReceipt(team.origin, d);
       return d.kind === "approve" ? { approve: true, nonce: d.auth_ref as `0x${string}`, validBefore: d.valid_before } : { approve: false, message: teamMessage(d, q.intentId) };
@@ -862,6 +955,24 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     try {
       res = await live(lease, req, r, t0, authorize);
     } catch (e) {
+      if (e instanceof PaymentRefusedError && LOCAL_REFUSALS.has(e.code) && e.receipt?.quote) {
+        // Refused before the team was asked: tell it, so the ledger counts what was saved. Never awaited, never thrown.
+        const q = e.receipt.quote;
+        void team.reportRefusal({
+          wallet: signer.address,
+          intent_id: e.receipt.intent_id,
+          resource_url: e.receipt.url,
+          pay_to: q.pay_to,
+          amount_atomic: q.amount_atomic,
+          network,
+          asset: q.asset,
+          scheme: q.scheme,
+          protocol: "x402",
+          reason: e.code as TeamRefusalReason,
+          verdict: e.receipt.seller.verdict,
+          ...(project ? { project } : {}),
+        });
+      }
       await settle(e instanceof SafeFetchError ? e.receipt : undefined);
       if (decision && e instanceof PaymentRefusedError && e.code === "refused_authorize") {
         throw new TeamRefusedError(decision, e.message, e.sellerUrl, e.receipt);

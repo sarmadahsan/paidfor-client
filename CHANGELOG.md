@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+- **A payment the seller rejects is no longer recorded as paid.** When the paid request is answered with HTTP 402
+  again and nothing settled (no settlement header, or one with `success: false`), as happens with a wallet that has
+  no USDC, the receipt now says `outcome: "payment_rejected"` and `paid: false` (it said `validator_failed` and
+  `paid: true`). The response is still returned, with status 402. No price is recorded in `prices.json`, no telemetry
+  row is sent in either version (before, a verified row reported `non_delivery` against the seller), and in team mode
+  the approval is reported as not paid (`paid: false`), so the team releases it instead of recording a settlement.
+  `reported_outcome` is `error`, the harness name for "not paid"; `proof` is null. A 402 whose settlement header
+  cannot be read is still treated as paid, since it may name a settlement.
+- **Retrying a rejected payment.** The intent is kept in the new phase `rejected` with the signed nonce and
+  deadline, and a retry with the same `intentId` is allowed (before, it replayed the 402). Without `team` or
+  `authorize` the retry signs the same nonce again, so at most one of the two authorizations can ever settle. With an
+  approval naming a different nonce, the retry refuses with `refused_authorize` until the rejected authorization's
+  deadline has passed. A new `intentId` signs a new nonce as before. See "When the seller rejects the payment" in
+  the README for what to check on chain.
+- New receipt field `valid_before`: the signed authorization's deadline, Unix seconds (null when nothing was signed).
+  `Outcome` gains `payment_rejected`. Both are additive; older receipts lack the field.
+- **Team mode tells the team about local refusals.** A payment refused before the team is asked (`refused_verdict`,
+  `refused_ratio`, `refused_max_per_call`) is posted to `{origin}/v1/team/refusals` with the quote, the reason and
+  the verdict, so the ledger and the bill can count what was saved. Fire-and-forget: 2-second timeout, never awaited,
+  every failure (including a 404 from a server without the route) swallowed and never logged; the thrown error is
+  unchanged. The key goes only to the team origin.
+- **`team.project`**, and `PAIDFOR_PROJECT` when team mode comes from `PAIDFOR_TEAM_KEY`: a project tag sent as
+  `project` on every authorize and refusal notice. A tag the server would refuse (it must be 1 to 64 letters, digits,
+  spaces or `. _ -` after trimming) throws when `safeFetch` is called. An empty `PAIDFOR_PROJECT` is ignored.
+- **`telemetryNotice`**: `false` turns off the one-time notice about verified telemetry; a function receives it
+  instead of `logger.warn`. The default is unchanged.
+- README: `verification_url` is live (the "not live yet" note is gone); the team section says
+  `npx -y @paidfor/mcp@latest`, as does the "wallet not registered" message; sample rows show
+  `x402-safe-fetch/<version>`. New outcome table.
+- Exported: `cleanProject` and the types `TeamRefusalBody`, `TeamRefusalReason`.
+- `client` in telemetry rows and the `X-Paidfor-Client` header is `x402-safe-fetch/0.6.0`.
+
 ## 0.5.0
 
 - **Team mode: `team: { key }`.** Budgets per wallet, human approvals and a ledger from a paidfor team account, with

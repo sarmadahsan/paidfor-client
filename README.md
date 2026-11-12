@@ -44,7 +44,9 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
    receipts directory before signing, and the signed nonce is written before the payment is sent. A retry with
    the same `intentId` and request returns the stored response and never signs again. A retry with the same
    `intentId` and a different request throws `IntentConflictError`. If a payment was signed but no response was
-   stored, a retry throws `IntentIndeterminateError` instead of paying again.
+   stored, a retry throws `IntentIndeterminateError` instead of paying again. A payment the seller rejected
+   (`payment_rejected`, below) may be retried with the same `intentId`: it signs the same nonce again, so at most
+   one of the two authorizations can ever settle.
 3. **After the response.** The configured validators run on the paid response. `res.receipt` carries the intent
    id, quote, amount, reference price and its source, seller verdict, validator results, the settlement header,
    and the on-chain tx hash when the header carries it. The same receipt is written to the receipts directory as
@@ -64,6 +66,42 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 | Non-USDC assets, other networks, non-`exact` schemes, and redirects of the paid request | A seller that settles and then serves wrong or stale content that still passes the four validators |
 | Silent non-delivery: a paid 4xx/5xx, empty, wrong content type or truncated body is flagged in the receipt | Getting the money back: validators report failures, they do not refund or dispute |
 
+## Outcomes
+
+`res.receipt.outcome` (and `err.receipt.outcome` on a thrown error):
+
+| `outcome` | What happened | `paid` | Returned or thrown |
+| --- | --- | --- | --- |
+| `ok` | Paid, and every validator passed. | `true` | Returned |
+| `validator_failed` | Paid, and a validator failed (a non-2xx answer, an empty or truncated body, the wrong content type). | `true` | Returned |
+| `payment_rejected` (0.6.0) | The signed payment was sent and the seller answered HTTP 402 again, with no settlement header or one saying it failed: usually a wallet without enough USDC. Nothing settled. | `false` | Returned (status 402) |
+| `paid_no_response` | Signed and maybe sent, and no response came back. | `true` if sent | Thrown |
+| `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | Refused before signing. | `false` | Thrown |
+| `no_acceptable_quote` | No exact USDC quote on the configured network. | `false` | Thrown |
+| `no_payment_required` | The resource answered without a 402. | `false` | Returned |
+| `replayed` | The stored result of an earlier call with this `intentId`. | `false` | Returned |
+| `error` | Anything else before signing (network, SDK). | `false` | Thrown |
+
+### When the seller rejects the payment
+
+A `payment_rejected` receipt has `paid: false`, no `tx_hash`, no `proof`, and `error.code` `payment_rejected`.
+No price is learnt from it, no telemetry row is sent (it says nothing about the seller), and in team mode the
+approval is reported as not paid, so the team releases it.
+
+The one real risk: the signed EIP-3009 authorization stays valid until its deadline, so whoever holds it (the seller
+or its facilitator) could still settle it later, for example once the wallet is funded. The receipt keeps what you
+need to check: `payer`, `nonce` and `valid_before` (Unix seconds). After `valid_before` has passed the authorization
+can never be used; to be sure nothing moved, read `authorizationState(payer, nonce)` on the USDC contract on Base
+(`true` means it was used), or look for that `AuthorizationUsed` event. Until then:
+
+- Retrying with the same `intentId` is allowed, because nothing was paid. Without `team` or `authorize` the retry
+  signs the same nonce, so at most one of the two authorizations can ever move money. With `team` or `authorize`
+  the approval names the nonce: the retry signs only if it names the same nonce or the old deadline has passed,
+  and otherwise refuses with `refused_authorize` and says until when. (The team server answers a retry with
+  `released_not_expired` until that deadline in any case.)
+- A new `intentId` is a new purchase with a new nonce: only use one once you have checked the old nonce, or after
+  its deadline.
+
 ## Receipts directory
 
 ```
@@ -76,9 +114,9 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 ```
 
 Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, with
-`telemetry: "verified"`, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, where you can
-later see whether the index verified your row on-chain. **That route is not live yet: until the index ships it,
-the URL answers 404.** `reported_outcome` is the outcome under the harness names, as the row reports it.
+`telemetry: "verified"`, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, which shows
+whether the index has verified your row on-chain (usually within about five minutes of the payment).
+`reported_outcome` is the outcome under the harness names, as the row reports it.
 
 Keep this directory if you want the idempotency guarantee to survive restarts.
 
@@ -97,7 +135,7 @@ v1 row:
 
 ```json
 { "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/0.3.0" }
+  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/<version>" }
 ```
 
 Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
@@ -123,7 +161,7 @@ This is the whole message, for a paid call that got a 500:
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.3.0",
+  "client": "x402-safe-fetch/<version>",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",
@@ -160,7 +198,8 @@ This is the whole message, for a paid call that got a 500:
   validator evidence are never sent.
 - **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
   refusal, never in a failure rate. A refusal by `authorize` sends no row at all: a buyer's own rule says nothing
-  about the seller.
+  about the seller. Nor does a `payment_rejected` call (0.6.0): nothing was paid, and a wallet that cannot pay is
+  not the seller's failure.
 - **Outcomes use the index's names:** `ok`, `non_delivery` (a non-2xx answer or a failed delivery validator after paying),
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
@@ -169,7 +208,8 @@ This is the whole message, for a paid call that got a 500:
   default) sends nothing. `indexUrl: false` turns off the index lookup and all telemetry.
 
 The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
-here.
+here, through `logger.warn` (stderr with the default console). `telemetryNotice: false` turns it off;
+`telemetryNotice: (msg) => ...` sends it to your own function instead. Nothing else changes.
 
 ## With a team account
 
@@ -197,13 +237,21 @@ What you get:
 - `receipt.team` says what the team decided, carries any `warnings` the server sent, and `outcome_report` (`sent`,
   `queued` or `rejected`).
 
+- A payment this client refuses by itself before asking the team (`refused_verdict`, `refused_ratio`,
+  `refused_max_per_call`) is told to the team (`POST {origin}/v1/team/refusals`, with the quote, the reason and the
+  verdict), so the ledger and the bill can show what was saved. That notice is fire-and-forget: a 2-second timeout,
+  never awaited, every failure swallowed, and the error you get is the same either way.
+- `project` (0.6.0) tags every payment, so the ledger and the bill can be read by project:
+  `team: { key, project: "research-q4" }`. A tag is 1 to 64 letters, digits, spaces or `. _ -`; anything else throws
+  when `safeFetch` is called.
+
 The wallet must be registered to the team: on [paidfor.dev/team](https://paidfor.dev/team), or with
-`npx -y @paidfor/mcp@0.7.0 init --wallet --link` (add `--key-file <path>` for a key file of your own). The key goes
+`npx -y @paidfor/mcp@latest init --wallet --link` (add `--key-file <path>` for a key file of your own). The key goes
 only to the team origin, never to a seller, and is never logged. `team` also takes `origin` (https only, or
-http on localhost), `authorizeTimeoutMs` (default 10000) and `reportTimeoutMs` (default 5000).
+http on localhost), `authorizeTimeoutMs` (default 10000), `reportTimeoutMs` (default 5000) and `project`.
 
 When `team` is left out and `PAIDFOR_TEAM_KEY` is set in the environment, team mode turns on by itself (a
-one-line notice says so); `team: false` turns it off. `team` and `authorize` together throw: `team` supplies its own
+one-line notice says so), and `PAIDFOR_PROJECT`, when set, is the project tag; `team: false` turns it off. `team` and `authorize` together throw: `team` supplies its own
 `authorize`, and with your own `authorize` the environment is not read.
 
 ## Ask before paying
@@ -256,11 +304,12 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 
 | Error | `code` | Paid? |
 | --- | --- | --- |
-| `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | No |
+| `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` (also: a retry after `payment_rejected` whose approval names a new nonce before the old deadline) | No |
 | `TeamRefusedError` (a `PaymentRefusedError`) | `refused_authorize`; `decision` says why | No |
 | `IntentConflictError` | `intent_conflict` | No |
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |
 | `SafeFetchError` | `paid_no_response` | Signed and possibly settled; `receipt.nonce` identifies it |
+| none: returned with status 402 | `receipt.outcome` `payment_rejected` | No; the authorization stays valid until `receipt.valid_before` (see "When the seller rejects the payment") |
 | `SafeFetchError` | `no_acceptable_quote`, `intent_in_flight`, `network`, `sdk` | No |
 
 ## Example
