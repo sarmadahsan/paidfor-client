@@ -118,7 +118,8 @@ export interface OutcomeInput {
  */
 export function harnessOutcome(i: OutcomeInput): TelemetryOutcome {
   if (i.outcome !== "ok" && i.outcome !== "validator_failed") {
-    return i.outcome === "replayed" || i.outcome === "no_payment_required" ? "error" : i.outcome;
+    // payment_rejected is the harness's not_paid, which a v2 row names `error`. The client sends no row for it.
+    return i.outcome === "replayed" || i.outcome === "no_payment_required" || i.outcome === "payment_rejected" ? "error" : i.outcome;
   }
   const failed = new Set(i.validatorFailures);
   const delivered = i.status !== undefined ? i.status >= 200 && i.status < 300 : !failed.has("http_status");

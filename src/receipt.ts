@@ -19,6 +19,7 @@ export type Outcome =
   | "no_acceptable_quote"
   | "no_payment_required"
   | "paid_no_response"
+  | "payment_rejected"
   | "replayed"
   | "error";
 
@@ -33,7 +34,10 @@ export interface Receipt {
   finished_at: string;
   latency_ms: number;
   outcome: Outcome;
-  /** True when a payment authorization was sent to the seller. */
+  /**
+   * True when a payment authorization was sent to the seller and the seller did not reject it. False for
+   * `payment_rejected` (sent, but answered HTTP 402 with no settlement): see `nonce` and `valid_before`.
+   */
   paid: boolean;
   /** True when this result was served from the intent store without contacting the seller. */
   replayed: boolean;
@@ -65,6 +69,11 @@ export interface Receipt {
   nonce: string | null;
   /** authorization.from of the signed payment, lowercase. */
   payer: string | null;
+  /**
+   * authorization.validBefore of the signed payment, Unix seconds: until then the authorization could still be
+   * settled by whoever holds it. Null when nothing was signed. (0.6.0; absent on older receipts.)
+   */
+  valid_before?: number | null;
   /** Proof of payment for a sent authorization (the `proof` of a v2 telemetry row). Null when nothing was sent. */
   proof: TelemetryProof | null;
   /** The outcome under the harness names, as a v2 telemetry row reports it. */

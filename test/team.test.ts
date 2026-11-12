@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { PaymentRefusedError, TeamClient, TeamRefusedError, readDecision, safeFetch, type SafeFetchOptions, type TeamDecision } from "../src/index.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
-import { NETWORK, TX, USDC_SEPOLIA, payTo, startMock, type Mock } from "./mock.js";
+import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
 
 const KEY = "pft_test_0123456789abcdef";
 const ORIGIN = "https://team.test";
@@ -22,24 +22,31 @@ const warnings: string[] = [];
 let requests: Sent[];
 let authorizeAnswer: () => Answer;
 let outcomeAnswer: () => Answer;
+let refusalAnswer: () => Answer;
 let savedEnv: string | undefined;
+let savedProject: string | undefined;
 
 beforeAll(async () => {
   mock = await startMock();
   savedEnv = process.env.PAIDFOR_TEAM_KEY;
+  savedProject = process.env.PAIDFOR_PROJECT;
 });
 afterAll(async () => {
   if (savedEnv === undefined) delete process.env.PAIDFOR_TEAM_KEY;
   else process.env.PAIDFOR_TEAM_KEY = savedEnv;
+  if (savedProject === undefined) delete process.env.PAIDFOR_PROJECT;
+  else process.env.PAIDFOR_PROJECT = savedProject;
   await mock.close();
 });
 beforeEach(async () => {
   delete process.env.PAIDFOR_TEAM_KEY;
+  delete process.env.PAIDFOR_PROJECT;
   mock.reset();
   warnings.length = 0;
   requests = [];
   authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later(), ledger_id: "led_1", intent_id: "x", verdict: "ok", seller: "127.0.0.1", usd: "0.01", replayed: false } });
   outcomeAnswer = () => ({ status: 200, body: { ok: true, replayed: false, row: {} } });
+  refusalAnswer = () => ({ status: 404 }); // the route may not be live yet
   dir = await mkdtemp(join(tmpdir(), "x402-safe-fetch-team-"));
 });
 afterEach(async () => {
@@ -57,7 +64,7 @@ const fakeFetch: typeof fetch = async (input, init) => {
   requests.push({ url, headers, body });
   const path = new URL(url).pathname;
   if (url.startsWith(ORIGIN) || url.startsWith("https://paidfor.dev/v1/team")) {
-    const a = path === "/v1/team/authorize" ? authorizeAnswer() : path === "/v1/team/outcome" ? outcomeAnswer() : { status: 404 };
+    const a = path === "/v1/team/authorize" ? authorizeAnswer() : path === "/v1/team/outcome" ? outcomeAnswer() : path === "/v1/team/refusals" ? refusalAnswer() : { status: 404 };
     if (a === "throw") throw new TypeError("fetch failed");
     if (a === "hang") {
       return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
@@ -158,7 +165,7 @@ describe("team mode: anything but a clean approve pays nothing", () => {
     ["a decline", () => ({ status: 200, body: { decision: "decline", reason: "wallet_daily_budget", message: "Today's budget of $5 is used." } }), "decline", /wallet_daily_budget.*Today's budget/],
     ["an already-settled intent", () => ({ status: 200, body: { decision: "already_settled", settlement_ref: TX, outcome: "ok" } }), "already_settled", /already paid.*nothing was paid again/],
     ["a bad key (401)", () => ({ status: 401, body: { error: "bad key" } }), "failed", /refused the team key/],
-    ["an unregistered wallet (404)", () => ({ status: 404, body: { error: "unknown wallet" } }), "failed", /not registered.*team\.test\/team.*npx -y @paidfor\/mcp@0\.7\.0 init --wallet --link/],
+    ["an unregistered wallet (404)", () => ({ status: 404, body: { error: "unknown wallet" } }), "failed", /not registered.*team\.test\/team.*npx -y @paidfor\/mcp@latest init --wallet --link/],
     ["a 500", () => ({ status: 500, body: { error: "boom" } }), "failed", /HTTP 500/],
     ["a 503", () => ({ status: 503 }), "failed", /HTTP 503/],
     ["a 200 that is not JSON", () => ({ status: 200, raw: "<html>ok</html>" }), "failed", /could not be read/],
@@ -353,5 +360,173 @@ describe("team mode: configuration", () => {
     expect(() => client({ team: { key: KEY, origin: "http://paidfor.dev" } })).toThrow(/must be https/);
     expect(() => client({ team: { key: "  " } })).toThrow(TypeError);
     expect(() => client({ team: { key: KEY, origin: "http://localhost:3000" } })).not.toThrow();
+  });
+});
+
+describe("team mode: a payment the seller rejects", () => {
+  it("is reported as not paid, so the approval is released, and the receipt says not paid", async () => {
+    mock.st.mode = "reject_402";
+    const res = await client()(`${mock.base}/x`, {}, { intentId: "empty" });
+    expect(res.receipt).toMatchObject({ outcome: "payment_rejected", paid: false, nonce: REF });
+    expect(teamCalls("/v1/team/outcome").map((r) => r.body)).toEqual([{ wallet: account.address, intent_id: "empty", auth_ref: REF, paid: false }]);
+    expect(res.receipt.team?.outcome_report).toBe("sent");
+  });
+
+  it("a retry the server declines while the old approval can be used pays nothing; after it lapses the same intent pays", async () => {
+    mock.st.mode = "reject_402";
+    const c = client();
+    await c(`${mock.base}/x`, {}, { intentId: "retry" });
+    mock.st.mode = "ok";
+    authorizeAnswer = () => ({ status: 200, body: { decision: "decline", reason: "released_not_expired", message: "Wait.", retry_after: later() } });
+    const err = (await c(`${mock.base}/x`, {}, { intentId: "retry" }).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err).toBeInstanceOf(TeamRefusedError);
+    expect(mock.st.paidCount).toBe(1);
+    // An approval with the same nonce (as a server handing back the standing one would) pays.
+    authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later() } });
+    const paid = await c(`${mock.base}/x`, {}, { intentId: "retry" });
+    expect(paid.receipt).toMatchObject({ outcome: "ok", paid: true, nonce: REF });
+    expect(teamCalls("/v1/team/outcome").map((r) => (r.body as { paid: boolean }).paid)).toEqual([false, true]);
+  });
+
+  it("an approval with a new nonce while the rejected one can still settle signs nothing and is released", async () => {
+    mock.st.mode = "reject_402";
+    const c = client();
+    await c(`${mock.base}/x`, {}, { intentId: "two" });
+    mock.st.mode = "ok";
+    const other = `0x${"6d".repeat(32)}`;
+    authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: other, valid_before: later() } });
+    const err = (await c(`${mock.base}/x`, {}, { intentId: "two" }).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err).toBeInstanceOf(TeamRefusedError);
+    expect(err.message).toMatch(/can still be settled until/);
+    expect(mock.st.nonces).toEqual([REF]);
+    expect(teamCalls("/v1/team/outcome").map((r) => r.body)).toEqual([
+      { wallet: account.address, intent_id: "two", auth_ref: REF, paid: false },
+      { wallet: account.address, intent_id: "two", auth_ref: other, paid: false },
+    ]);
+  });
+});
+
+describe("team mode: refusals made before asking the team", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 50));
+  /** Index answer for the mock seller host. */
+  const indexAnswer = (name: string, patch: Record<string, unknown> = {}) => {
+    mock.st.index = { kind: "json", body: { ...(fixture(name) as Record<string, unknown>), host: "127.0.0.1", seller_url: "https://paidfor.dev/seller/127.0.0.1", ...patch } };
+  };
+
+  it.each<[string, () => Partial<SafeFetchOptions>, string, string]>([
+    ["an avoid seller", () => (indexAnswer("check-avoid"), {}), "refused_verdict", "avoid"],
+    ["a quote over the listed price", () => (indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.005000" } }), {}), "refused_ratio", "ok"],
+    ["a quote over maxPerCallUsd", () => ({ maxPerCallUsd: 0.001 }), "refused_max_per_call", "unknown"],
+  ])("%s is told to the team, and the thrown error is unchanged", async (_n, setup, reason, verdict) => {
+    const err = (await client({ ...setup(), team: { key: KEY, origin: ORIGIN, project: "research-q4" } })(`${mock.base}/data?q=1`, {}, { intentId: "ref-1" }).catch((e: unknown) => e)) as PaymentRefusedError;
+    expect(err).toBeInstanceOf(PaymentRefusedError);
+    expect(err).not.toBeInstanceOf(TeamRefusedError);
+    expect(err.code).toBe(reason);
+    expect(teamCalls("/v1/team/authorize")).toEqual([]);
+    expect(teamCalls("/v1/team/outcome")).toEqual([]);
+    await settle();
+    const sent = teamCalls("/v1/team/refusals");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.url).toBe(`${ORIGIN}/v1/team/refusals`);
+    expect(sent[0]!.headers).toMatchObject({ authorization: `Bearer ${KEY}`, "content-type": "application/json" });
+    expect(sent[0]!.body).toEqual({
+      wallet: account.address,
+      intent_id: "ref-1",
+      resource_url: `${mock.base}/data?q=1`,
+      pay_to: payTo,
+      amount_atomic: "10000",
+      network: NETWORK,
+      asset: USDC_SEPOLIA,
+      scheme: "exact",
+      protocol: "x402",
+      reason,
+      verdict,
+      project: "research-q4",
+    });
+    expect(mock.st.paidCount).toBe(0);
+    expect(warnings.join("\n")).not.toContain(KEY);
+  });
+
+  it.each<[string, () => Answer]>([
+    ["a 404 (route not live yet)", () => ({ status: 404 })],
+    ["a 500", () => ({ status: 500, body: { error: "boom" } })],
+    ["a network error", () => "throw"],
+    ["no answer at all", () => "hang"],
+  ])("%s is swallowed: never awaited, never logged, never changes the error", async (_n, answer) => {
+    refusalAnswer = answer;
+    indexAnswer("check-avoid");
+    const t0 = Date.now();
+    const err = (await client()(`${mock.base}/x`).catch((e: unknown) => e)) as PaymentRefusedError;
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(err.code).toBe("refused_verdict");
+    expect(err.message).toMatch(/rates this seller "avoid"/);
+    await settle();
+    expect(teamCalls("/v1/team/refusals")).toHaveLength(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a refusal notice that never answers is abandoned after 2 s", async () => {
+    let aborted: number | undefined;
+    const t0 = Date.now();
+    const f: typeof fetch = async (input, init) => {
+      if (String(input).endsWith("/v1/team/refusals")) {
+        return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => ((aborted = Date.now() - t0), reject(init.signal!.reason))));
+      }
+      return fakeFetch(input, init);
+    };
+    await expect(client({ fetch: f, maxPerCallUsd: 0.001 })(`${mock.base}/x`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    await new Promise((r) => setTimeout(r, 2300));
+    expect(aborted).toBeGreaterThanOrEqual(1900);
+    expect(aborted).toBeLessThan(2300);
+  });
+
+  it("a refusal by the team itself, or without team mode, sends no refusal notice", async () => {
+    authorizeAnswer = () => ({ status: 200, body: { decision: "decline", reason: "wallet_daily_budget", message: "no" } });
+    await expect(client()(`${mock.base}/x`)).rejects.toBeInstanceOf(TeamRefusedError);
+    indexAnswer("check-avoid");
+    await expect(client({ team: false })(`${mock.base}/x`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    await settle();
+    expect(teamCalls("/v1/team/refusals")).toEqual([]);
+  });
+});
+
+describe("team mode: project", () => {
+  it("sends team.project, trimmed, on every authorize", async () => {
+    await client({ team: { key: KEY, origin: ORIGIN, project: "  research-q4 " } })(`${mock.base}/x`);
+    expect(teamCalls("/v1/team/authorize")[0]!.body).toMatchObject({ project: "research-q4" });
+  });
+
+  it("sends no project field when none is set", async () => {
+    await client()(`${mock.base}/x`);
+    expect(teamCalls("/v1/team/authorize")[0]!.body).not.toHaveProperty("project");
+  });
+
+  it("reads PAIDFOR_PROJECT only when team mode comes from the environment", async () => {
+    process.env.PAIDFOR_TEAM_KEY = KEY;
+    process.env.PAIDFOR_PROJECT = "Data team.v2_x";
+    await client({ noTeam: true })(`${mock.base}/x`);
+    expect(teamCalls("/v1/team/authorize")[0]!.body).toMatchObject({ project: "Data team.v2_x" });
+    requests = [];
+    await client()(`${mock.base}/y`);
+    expect(teamCalls("/v1/team/authorize")[0]!.body).not.toHaveProperty("project");
+    requests = [];
+    process.env.PAIDFOR_PROJECT = "   ";
+    await client({ noTeam: true })(`${mock.base}/z`);
+    expect(teamCalls("/v1/team/authorize")[0]!.body).not.toHaveProperty("project");
+  });
+
+  it.each(["", "a/b", "x".repeat(65), "tab\there", "émoji", 7 as unknown as string])("refuses the tag %j when the client is made", (bad) => {
+    expect(() => client({ team: { key: KEY, origin: ORIGIN, project: bad } })).toThrow(/team\.project .* is not a project tag: a project tag is 1 to 64 letters/);
+  });
+
+  it("refuses a bad PAIDFOR_PROJECT when the client is made", () => {
+    process.env.PAIDFOR_TEAM_KEY = KEY;
+    process.env.PAIDFOR_PROJECT = "q4/research";
+    expect(() => client({ noTeam: true })).toThrow(/PAIDFOR_PROJECT "q4\/research" is not a project tag/);
+    expect(() => client({ noTeam: true, team: false })).not.toThrow();
+  });
+
+  it("accepts the longest tag the server takes", () => {
+    expect(() => client({ team: { key: KEY, origin: ORIGIN, project: "x".repeat(64) } })).not.toThrow();
   });
 });

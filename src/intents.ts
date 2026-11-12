@@ -9,6 +9,11 @@
  *              `signed` is written before the paid request is sent, and a failed write aborts the send)
  *   signed     authorization signed; paid request about to go -> a retry throws IntentIndeterminateError, never re-signs
  *   completed  paid response stored                           -> a retry returns the stored response, never re-signs
+ *   rejected   signed and sent, and the seller answered 402 with no settlement -> a retry may proceed, but the
+ *              signed nonce, payer, network and asset are kept in `rejected` (carried over every later attempt): a
+ *              retry by the same payer on the same network and asset signs that same nonce, or, with an approval
+ *              naming another nonce, only once the old one's deadline has passed; any other payer, network or
+ *              asset is refused
  *   unpaid / refused / failed_unpaid                          -> a retry may proceed (nothing was signed)
  */
 import { createHash } from "node:crypto";
@@ -17,7 +22,24 @@ import { join } from "node:path";
 import { IntentConflictError, IntentIndeterminateError, SafeFetchError } from "./errors.js";
 import { writeJsonDurable } from "./fsutil.js";
 
-export type IntentPhase = "reserved" | "signing" | "signed" | "completed" | "unpaid" | "refused" | "failed_unpaid";
+export type IntentPhase = "reserved" | "signing" | "signed" | "completed" | "unpaid" | "refused" | "failed_unpaid" | "rejected";
+
+/**
+ * A signed authorization the seller rejected. It can be used until `valid_before` (Unix seconds; null if unknown). Its
+ * nonce is reused only by the same payer, network and asset: an EIP-3009 nonce is spent once per payer per token
+ * contract, so the same nonce from another wallet, chain or token would be a second authorization that could also
+ * settle. Records from before 0.6.0's fix have no payer and are never reused.
+ */
+export interface RejectedAuthorization {
+  nonce: string;
+  valid_before: number | null;
+  /** authorization.from, lowercase. */
+  payer?: string;
+  /** CAIP-2. */
+  network?: string;
+  /** Token contract, lowercase. */
+  asset?: string;
+}
 
 export interface StoredResponse {
   url: string;
@@ -42,6 +64,8 @@ export interface IntentRecord {
   pay_to?: string;
   receipt_file?: string;
   response?: StoredResponse;
+  /** The last authorization for this intent the seller rejected, kept across attempts. */
+  rejected?: RejectedAuthorization;
 }
 
 export interface IntentLease {
@@ -163,6 +187,8 @@ export class IntentStore {
           attempts: (prior?.attempts ?? 0) + 1,
           created_at: prior?.created_at ?? ts,
           updated_at: ts,
+          // A rejected authorization may still be settled until its deadline: every later attempt must know its nonce.
+          ...(prior?.rejected ? { rejected: prior.rejected } : {}),
         };
         await writeJsonDurable(file, record);
       }
