@@ -73,6 +73,11 @@ export interface TeamDecisionExtras {
   usage?: Record<string, unknown>;
   /** The ledger row for this decision, when the server named one. */
   ledger_id?: string;
+  /**
+   * Whether this payment's outcome goes to the index, as the account decides it (`telemetry.report`). "off" only when
+   * the team is on a plan that allows it and turned reporting off; absent (an older server, or anything else) means report.
+   */
+  telemetry?: "verified" | "off";
 }
 
 /** The server's answer, read strictly. Only `approve` lets a payment be signed. */
@@ -149,7 +154,9 @@ function extras(d: Record<string, unknown>): TeamDecisionExtras {
       })
     : [];
   const usage = d.usage && typeof d.usage === "object" && !Array.isArray(d.usage) ? (d.usage as Record<string, unknown>) : undefined;
-  return { warnings, ...(usage ? { usage } : {}), ...(str(d.ledger_id) ? { ledger_id: d.ledger_id } : {}) };
+  const t = d.telemetry && typeof d.telemetry === "object" ? (d.telemetry as Record<string, unknown>).report : undefined;
+  const telemetry = t === "off" ? "off" : t === "verified" ? "verified" : undefined;
+  return { warnings, ...(usage ? { usage } : {}), ...(str(d.ledger_id) ? { ledger_id: d.ledger_id } : {}), ...(telemetry ? { telemetry } : {}) };
 }
 
 function failedStatus(status: number, body: unknown, wallet: string, origin: string): TeamDecision {
@@ -241,6 +248,8 @@ export class TeamClient {
   /** Reports that could not be written to disk; sent again like the disk queue, lost if the process ends. */
   private readonly memory = new Map<string, TeamOutcomeBody>();
   private flushing: Promise<void> | null = null;
+  /** What the last authorize answer said about reporting to the index; undefined until one says, and after any that does not. */
+  private lastTelemetry: "verified" | "off" | undefined;
 
   constructor(o: TeamClientOptions) {
     if (typeof o.key !== "string" || !o.key.trim() || /\s/.test(o.key.trim())) throw new TypeError("team: key must be a non-empty team key with no spaces");
@@ -270,6 +279,21 @@ export class TeamClient {
 
   /** Never throws: anything but a 200 with a readable decision is { kind: "failed" }. */
   async authorize(body: TeamAuthorizeBody): Promise<TeamDecision> {
+    const d = await this.ask(body);
+    // Fail towards reporting: an answer that does not say "off" (an older server, a failure) clears what an earlier one said.
+    this.lastTelemetry = d.telemetry;
+    return d;
+  }
+
+  /**
+   * Whether outcomes go to the index, from the last authorize answer: "off" only when the account turned reporting off
+   * on a plan that allows it. Undefined before any answer said so, which means report.
+   */
+  telemetryReport(): "verified" | "off" | undefined {
+    return this.lastTelemetry;
+  }
+
+  private async ask(body: TeamAuthorizeBody): Promise<TeamDecision> {
     let res: Response;
     try {
       res = await this.post("/v1/team/authorize", body, this.authorizeTimeoutMs);

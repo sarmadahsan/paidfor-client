@@ -24,7 +24,7 @@ import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harness
 import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
 import { PROJECT_RULE, TEAM_ORIGIN, TeamClient, cleanProject, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt, type TeamRefusalReason } from "./team.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
-import { CLIENT_ID, buildPayload, buildPayloadV2, sendTelemetry } from "./telemetry.js";
+import { CLIENT_ID, buildPayloadV2, sendTelemetry } from "./telemetry.js";
 import { runAllValidators, validatorsByName } from "./validators/index.js";
 import type { RequestRecord } from "./validators/types.js";
 import { buildResponseRecord, headersToRecord } from "./x402/http.js";
@@ -56,8 +56,13 @@ export interface SafeFetchOptions {
   /** Validators to run on paid responses. Default: all four. */
   validators?: ValidatorName[];
   /**
-   * Default "off". "anonymous" posts the outcome-only v1 payload in docs/telemetry.md. "verified" posts the v2
-   * payload: the same fields plus a proof of payment (payer, nonce, pay-to, tx hash) the index checks on Base.
+   * Reporting each outcome to the index. On by default: the v2 payload in docs/telemetry.md, the outcome with a proof
+   * of payment (payer, nonce, pay-to, tx hash) the index checks on Base. paidfor is free because these reports feed it.
+   *
+   * The account decides, not this option: reporting stops only for a client in team mode whose account is on a paid
+   * plan and turned reporting off on its account page (the server says so in every authorize answer). "anonymous" and
+   * "off" ask for less than that; without such an account they are not honoured: verified rows are still sent and one
+   * line says so, once per process. Never a throw. `indexUrl: false` sends nothing (and checks no seller).
    */
   telemetry?: "anonymous" | "verified" | "off";
   /** Receipts, intents, price book and debug log. Default "./.x402-receipts" (resolved once, at creation). */
@@ -71,7 +76,7 @@ export interface SafeFetchOptions {
   /** Where "caution" verdicts and non-fatal local write failures are reported. Default console. */
   logger?: { warn(msg: string): void };
   /**
-   * The one-time notice that says what `telemetry: "verified"` sends. Default true: it goes to `logger.warn` (stderr
+   * The one-time notice that says what reporting sends. Default true: it goes to `logger.warn` (stderr
    * with the default console). `false` never shows it; a function receives the text instead of `logger`. Useful in
    * an MCP server, whose client may show anything on stderr as an error.
    */
@@ -191,6 +196,19 @@ function wrapResponse(status: number, statusText: string, headers: HeadersInit, 
 const TX_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 
 let envNoticeShown = false;
+/** The line that a request for less than verified reporting is not honoured, once per process. */
+let lessNoticeShown = false;
+/** The line that nothing is reported to a plain-http index, once per process. */
+let insecureNoticeShown = false;
+/** Tests only: show the once-per-process lines again. Not exported from the package. */
+export function resetOnceNotices(): void {
+  envNoticeShown = lessNoticeShown = insecureNoticeShown = false;
+}
+
+/** Said when `telemetry: "anonymous"` or `"off"` is not honoured: no account, or an account whose plan does not allow it. */
+export const TELEMETRY_NOT_HONOURED = (asked: string) =>
+  `telemetry: "${asked}" is not honoured: purchase outcomes are reported to the index with their proof of payment, because that is what keeps paidfor free. ` +
+  "Only a team account on a paid plan can turn reporting off, on its account page (https://paidfor.dev/team); plans: https://paidfor.dev/pricing. Shown once.";
 
 /** A project tag as the server takes it, or a TypeError naming where the bad one came from. */
 function projectTag(v: unknown, from: string): string {
@@ -284,10 +302,14 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const indexUrl = options.indexUrl === false ? undefined : (options.indexUrl ?? "https://paidfor.dev/v1").replace(/\/$/, "");
   const refuseVerdicts = new Set<Verdict>(options.refuseVerdicts ?? ["avoid"]);
   const validators = validatorsByName(options.validators ?? [...ALL_VALIDATORS]);
-  if (options.telemetry === "verified" && indexUrl !== undefined && !isSecureOrLoopback(indexUrl)) {
+  const secureIndex = indexUrl !== undefined && isSecureOrLoopback(indexUrl);
+  if (options.telemetry === "verified" && indexUrl !== undefined && !secureIndex) {
     throw new TypeError(`safeFetch: telemetry "verified" needs an https indexUrl (or a loopback one for local testing), got ${indexUrl}`);
   }
-  const telemetry = indexUrl !== undefined && (options.telemetry === "anonymous" || options.telemetry === "verified") ? options.telemetry : "off";
+  /** Rows carry the payer and nonce, so they go only to an https index, or to this machine. */
+  const reporting = secureIndex;
+  /** A request for less than verified, which only the account can grant (issue 41). */
+  const askedLess = options.telemetry === "anonymous" || options.telemetry === "off" ? options.telemetry : null;
   const receiptsDir = resolve(options.receiptsDir ?? "./.x402-receipts");
   const baseFetch = options.fetch ?? globalThis.fetch;
   const indexTimeoutMs = options.indexTimeoutMs ?? 2000;
@@ -306,7 +328,11 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   };
 
   const noticeOpt = options.telemetryNotice ?? true;
-  if (telemetry === "verified" && noticeOpt !== false) void verifiedNotice();
+  if (reporting && noticeOpt !== false) void verifiedNotice();
+  if (indexUrl !== undefined && !secureIndex && !insecureNoticeShown) {
+    insecureNoticeShown = true;
+    warn(`nothing is reported to ${indexUrl}: outcome reports carry the payer and nonce and go only to an https index (or a loopback one).`);
+  }
 
   const team = teamConf
     ? new TeamClient({
@@ -334,10 +360,10 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       /* first run */
     }
     const text =
-      'telemetry: "verified" sends each purchase outcome with its proof of payment (payer address, nonce, pay-to, tx hash) ' +
+      "reporting is on: each purchase outcome is sent with its proof of payment (payer address, nonce, pay-to, tx hash) " +
       `to ${indexUrl}/telemetry so the index can check it on Base. No bodies, request parameters, IP or identity. ` +
-      'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why ' +
-      '(set telemetry: "anonymous" or "off" to change it). Shown once.';
+      "This is what keeps paidfor free; a team account on a paid plan can turn it off on its account page. " +
+      'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why. Shown once.';
     if (typeof noticeOpt === "function") {
       try {
         noticeOpt(`x402-safe-fetch: ${text}`);
@@ -363,23 +389,43 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     }
   }
 
+  /**
+   * Whether this outcome goes to the index. The account decides: only a team answer saying "off" stops it (the
+   * payment's own authorize answer, or for a refusal before the team was asked the last one). No answer means report.
+   */
+  function reportsNow(): boolean {
+    return reporting && team?.telemetryReport() !== "off";
+  }
+
+  /** Say once that a request for less than verified reporting was not honoured. Never silent, never a throw. */
+  function lessNotice() {
+    if (!askedLess || lessNoticeShown) return;
+    lessNoticeShown = true;
+    const text = TELEMETRY_NOT_HONOURED(askedLess);
+    if (typeof noticeOpt === "function") {
+      try {
+        noticeOpt(`x402-safe-fetch: ${text}`);
+      } catch {
+        /* ignore */
+      }
+    } else warn(text);
+  }
+
   function emitTelemetry(r: Receipt) {
-    if (telemetry === "off" || !indexUrl) return;
+    if (!indexUrl || !reportsNow()) return;
     // Nothing was paid and the seller is not at fault for a wallet that cannot pay; the contract has no outcome for it.
     if (r.outcome === "payment_rejected") return;
+    lessNotice();
     try {
-      const payload =
-        telemetry === "verified"
-          ? buildPayloadV2({
-              url: r.url,
-              outcome: r.reported_outcome ?? "error",
-              amountUsdc: r.amount_usdc,
-              latencyMs: r.latency_ms,
-              validatorFailures: failureLabels(r.validator_failures, r.response?.status),
-              proof: r.proof,
-              unknownSeller: r.index_note === UNKNOWN_SELLER_NOTE,
-            })
-          : buildPayload({ url: r.url, outcome: r.outcome, amountUsdc: r.amount_usdc, latencyMs: r.latency_ms, validatorFailures: r.validator_failures });
+      const payload = buildPayloadV2({
+        url: r.url,
+        outcome: r.reported_outcome ?? "error",
+        amountUsdc: r.amount_usdc,
+        latencyMs: r.latency_ms,
+        validatorFailures: failureLabels(r.validator_failures, r.response?.status),
+        proof: r.proof,
+        unknownSeller: r.index_note === UNKNOWN_SELLER_NOTE,
+      });
       void sendTelemetry(indexUrl, payload, { receiptsDir, fetchImpl: baseFetch });
     } catch {
       /* never on the purchase path */
@@ -413,7 +459,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       responseSha256: r.response?.sha256 ?? null,
       declaredTimeoutS: r.quote.max_timeout_seconds,
     });
-    if (r.proof && telemetry === "verified" && indexUrl) {
+    if (r.proof && indexUrl && reportsNow()) {
       r.verification_url = `${indexUrl}/telemetry/${r.proof.payer}/${r.proof.nonce}`;
     }
   }

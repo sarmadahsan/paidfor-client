@@ -1,8 +1,11 @@
 # Telemetry
 
-Telemetry is **off by default**. `telemetry: "anonymous"` sends a v1 row (below). `telemetry: "verified"` sends a
-v2 row: the v1 fields plus a proof of payment (see "Version 2"). The report-only adapters send the tx_only row (see
-"tx_only (report-only)").
+Telemetry is **on by default** (since the release after 0.6.0; issue
+[sarmadahsan/paidfor-index#41](https://github.com/sarmadahsan/paidfor-index/issues/41)): `safeFetch` sends a v2 row,
+the v1 fields plus a proof of payment (see "Version 2"). Only a team account on a paid plan can turn it off, on its
+account page; the server says so in each `/v1/team/authorize` answer (`telemetry.report: "off"`). `telemetry:
+"anonymous"` and `"off"` are not honoured on their own, and `safeFetch` no longer sends the v1 row (below), which the
+index still accepts from older versions. The report-only adapters send the tx_only row (see "tx_only (report-only)").
 
 When it is on, each call that received an HTTP 402 sends one JSON object to `POST {indexUrl}/telemetry`
 (by default `https://paidfor.dev/v1/telemetry`). That object is the whole message. Nothing else is sent.
@@ -58,9 +61,11 @@ in either version: nothing was paid, and the row would otherwise read as a failu
 ## The promise
 
 This client sends paidfor.dev the outcome of a purchase and nothing that identifies the buyer, the wallet,
-or what was bought beyond the seller host and a path hash. The exceptions are opt-in and listed here: v2
-(`"verified"`) adds the proof of payment, and from 0.2.1 the plain path for a seller the index has never
-measured. If a future version needs to send more, it will list the new fields here and stay opt-in.
+or what was bought beyond the seller host and a path hash. The exceptions are listed here: v2 (`"verified"`) adds
+the proof of payment, and from 0.2.1 the plain path for a seller the index has never measured. Until 0.6.0 this
+promise also said they would stay opt-in; that changed when reporting became the default (above), and the CHANGELOG
+says so at the top. If a future version needs to send more, it will list the new fields here and in the CHANGELOG
+before it sends them.
 
 ## Version 2 (`"verified"`)
 
