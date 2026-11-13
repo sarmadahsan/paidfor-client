@@ -107,12 +107,34 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | --- | --- |
 | `duplicate` | More than one settlement observed for one intent. The client sends one paid request per intent, so in practice it never sees this. |
 | `error` | The settlement header says `success: false` and the answer was neither 2xx nor 402: the seller rejected the payment (the harness's `not_paid`). Proof is still sent, so the index can confirm nothing moved. A 402 with no settlement, or with `success: false`, is `payment_rejected` on the receipt and sends no row (0.6.0). |
-| `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. |
+| `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. `content_type` fails only on an HTML page or an undeclared `application/problem+json` document where another type was declared, or on JSON that does not parse; usable content in another format is `ok` with a warning (below). |
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
 | `ok` | None of the above. |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** A refusal by the `authorize` option (`refused_authorize` on the receipt) sends no row at all. |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
+
+### `warnings` (0.7.0): usable content in another format than declared
+
+A paid answer whose content is usable but whose format differs from the one the seller declared in its 402, or that
+has no `Content-Type` header, is `ok`, not `non_delivery`. Its v2 row adds one field, only when there is a warning:
+
+```json
+"outcome": "ok",
+"validator_failures": [],
+"warnings": ["content_type_mismatch"]
+```
+
+| Code | When |
+| --- | --- |
+| `content_type_mismatch` | The response's media type differs from the declared one (or from `application/json` when the seller declared none), and the body is not an HTML page, an undeclared `application/problem+json` document or JSON that fails to parse. Parameters and `+json` suffixes are the same format. |
+| `missing_content_type` | The response had no `Content-Type` header, and the body is usable by the same test. |
+
+Codes only: the declared and received types stay in the receipt (`receipt.warnings`), never in the row. A row without
+warnings has no `warnings` field, exactly as before. The index counts these rows as delivered (in the denominator, not
+in the failures) and shows them on the seller's page as their own observation. An index that predates the field
+answers 400 to a row that carries it, so it is sent only to paidfor.dev from the release that accepts it. v1
+(`"anonymous"`) rows carry no warnings: the call is simply `ok`.
 
 ### `path` (0.2.1): only for sellers the index has never measured
 

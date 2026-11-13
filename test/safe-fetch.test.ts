@@ -586,6 +586,57 @@ describe("safeFetch: telemetry", () => {
   });
 });
 
+describe("safeFetch: usable content in another format than declared (issue 40)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 200));
+
+  it("is ok with a warning on the receipt, reported ok with the warning code, not non_delivery", async () => {
+    mock.st.mode = "markdown";
+    const res = await client({ telemetry: "verified" })(`${mock.base}/v1/article`, {}, { intentId: "fmt-1" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("# Article 5");
+    const r = res.receipt;
+    expect(r).toMatchObject({ outcome: "ok", paid: true, validator_failures: [], reported_outcome: "ok" });
+    expect(r.validators.content_type).toMatchObject({ status: "pass", reason: "content_type_mismatch", evidence: { expected: "application/json", actual: "text/markdown", warning: true } });
+    expect(r.warnings).toEqual([
+      {
+        code: "content_type_mismatch",
+        validator: "content_type",
+        declared: "application/json",
+        received: "text/markdown",
+        message: "the seller declared application/json and the response is text/markdown; the content is returned as sent and the call is not counted as a failure",
+      },
+    ]);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+    expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "ok", validator_failures: [], warnings: ["content_type_mismatch"] });
+  });
+
+  it("keeps the warning on a replay", async () => {
+    mock.st.mode = "markdown";
+    const f = client();
+    await f(`${mock.base}/v1/article`, {}, { intentId: "fmt-2" });
+    const again = await f(`${mock.base}/v1/article`, {}, { intentId: "fmt-2" });
+    expect(again.receipt.replayed).toBe(true);
+    expect(again.receipt.warnings?.map((w) => w.code)).toEqual(["content_type_mismatch"]);
+  });
+
+  it("an HTML page served with 200 where JSON was declared stays a failure", async () => {
+    mock.st.mode = "html_200";
+    const res = await client({ telemetry: "verified" })(`${mock.base}/v1/article`, {}, { intentId: "fmt-3" });
+    expect(res.receipt).toMatchObject({ outcome: "validator_failed", validator_failures: ["content_type"], reported_outcome: "non_delivery", warnings: [] });
+    await settle();
+    expect(mock.st.telemetry[0]).toMatchObject({ outcome: "non_delivery", validator_failures: ["content_type"] });
+    expect(mock.st.telemetry[0]).not.toHaveProperty("warnings");
+  });
+
+  it("a row without warnings carries no warnings field (unchanged for older servers)", async () => {
+    const res = await client({ telemetry: "verified" })(`${mock.base}/data`, {}, { intentId: "fmt-4" });
+    expect(res.receipt.warnings).toEqual([]);
+    await settle();
+    expect(mock.st.telemetry[0]).not.toHaveProperty("warnings");
+  });
+});
+
 describe("safeFetch: verified telemetry (v2)", () => {
   const sha = (s: string) => createHash("sha256").update(s).digest("hex");
   const settle = () => new Promise((r) => setTimeout(r, 200));
