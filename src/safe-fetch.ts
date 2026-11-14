@@ -390,11 +390,20 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   }
 
   /**
-   * Whether this outcome goes to the index. The account decides: only a team answer saying "off" stops it (the
-   * payment's own authorize answer, or for a refusal before the team was asked the last one). No answer means report.
+   * Each payment's own authorize answer about reporting, kept with its receipt so that payments in flight at the same
+   * time never read each other's (a shared "last answer" would let one payment's answer decide another's row).
    */
-  function reportsNow(): boolean {
-    return reporting && team?.telemetryReport() !== "off";
+  const askedTeam = new WeakMap<Receipt, "verified" | "off" | undefined>();
+
+  /**
+   * Whether this outcome goes to the index. The account decides: only a team answer saying "off" stops it: this
+   * payment's own authorize answer, or, for a refusal made before this payment asked, the last answer the team gave.
+   * No answer means report.
+   */
+  function reportsNow(r: Receipt): boolean {
+    if (!reporting) return false;
+    if (!team) return true;
+    return (askedTeam.has(r) ? askedTeam.get(r) : team.telemetryReport()) !== "off";
   }
 
   /** Say once that a request for less than verified reporting was not honoured. Never silent, never a throw. */
@@ -412,7 +421,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   }
 
   function emitTelemetry(r: Receipt) {
-    if (!indexUrl || !reportsNow()) return;
+    if (!indexUrl || !reportsNow(r)) return;
     // Nothing was paid and the seller is not at fault for a wallet that cannot pay; the contract has no outcome for it.
     if (r.outcome === "payment_rejected") return;
     lessNotice();
@@ -459,7 +468,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       responseSha256: r.response?.sha256 ?? null,
       declaredTimeoutS: r.quote.max_timeout_seconds,
     });
-    if (r.proof && indexUrl && reportsNow()) {
+    if (r.proof && indexUrl && reportsNow(r)) {
       r.verification_url = `${indexUrl}/telemetry/${r.proof.payer}/${r.proof.nonce}`;
     }
   }
@@ -1027,6 +1036,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       const d = await team.authorize({ wallet: q.payer, intent_id: q.intentId, resource_url: q.url, pay_to: q.payTo, amount_atomic: q.amountAtomic, network: q.network, asset: q.asset, scheme: q.scheme, protocol: "x402", ...(project ? { project } : {}) });
       decision = d;
       r.team = teamReceipt(team.origin, d);
+      askedTeam.set(r, d.telemetry);
       return d.kind === "approve" ? { approve: true, nonce: d.auth_ref as `0x${string}`, validBefore: d.valid_before } : { approve: false, message: teamMessage(d, q.intentId) };
     };
     /** Say what happened to an approved payment, paid or not. Nothing to say when nothing was approved. */

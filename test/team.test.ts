@@ -614,6 +614,26 @@ describe("team mode: reporting to the index follows the account (issue 41)", () 
     expect(mock.st.telemetry).toHaveLength(1);
   });
 
+  it("payments in flight at the same time each follow their own answer (one's answer never decides another's row)", async () => {
+    let n = 0;
+    authorizeAnswer = () => (++n === 1 ? approve(PAID_OFF)() : "throw");
+    // A's paid request waits on the seller while B asks the team and gets no answer.
+    const slow: typeof fetch = async (input, init) => {
+      if (new Headers(init?.headers).get("payment-signature")) await new Promise((r) => setTimeout(r, 300));
+      return fakeFetch(input, init);
+    };
+    const f = client({ fetch: slow });
+    const a = f(`${mock.base}/data`, {}, { intentId: "overlap-a" });
+    await new Promise((r) => setTimeout(r, 100));
+    const b = f(`${mock.base}/data`, {}, { intentId: "overlap-b" }).catch((e: unknown) => e);
+    expect(await b).toBeInstanceOf(TeamRefusedError);
+    const res = await a;
+    expect(res.status).toBe(200);
+    expect(res.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
   it("the server cannot be asked: nothing is paid, and the next refusal reports", async () => {
     const f = client();
     authorizeAnswer = approve(PAID_OFF);
