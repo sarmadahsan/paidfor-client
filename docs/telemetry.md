@@ -132,8 +132,7 @@ has no `Content-Type` header, is `ok`, not `non_delivery`. Its v2 row adds one f
 
 Codes only: the declared and received types stay in the receipt (`receipt.warnings`), never in the row. A row without
 warnings has no `warnings` field, exactly as before. The index counts these rows as delivered (in the denominator, not
-in the failures) and shows them on the seller's page as their own observation. An index that predates the field
-answers 400 to a row that carries it, so it is sent only to paidfor.dev from the release that accepts it. v1
+in the failures) and shows them on the seller's page as their own observation. An index that predates the field answers 400 to a row that carries it (the client sends it to whatever `indexUrl` is set), so this release is published only after paidfor.dev accepts the field. v1
 (`"anonymous"`) rows carry no warnings: the call is simply `ok`.
 
 ### `path` (0.2.1): only for sellers the index has never measured
