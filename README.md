@@ -96,7 +96,8 @@ declares `application/json` and sends the article as `text/markdown`, or JSON la
 ```
 
 It stays a failure (`validator_failed`) when the answer has the shape of an error rather than of content: an HTML page
-(by its `Content-Type` or its first bytes) where HTML was not declared, an undeclared `application/problem+json`
+(by its `Content-Type` or its first bytes) where HTML was not declared (an HTML label over a body that parses as JSON is
+JSON mislabelled, so a warning), an undeclared `application/problem+json`
 document, or a body that should be JSON and does not parse. A different `+json` type or parameters (`; charset=utf-8`)
 are the same format and raise no warning. A seller that declares no type is judged against `application/json`.
 Empty, truncated and non-2xx answers fail as before.

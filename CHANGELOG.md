@@ -11,7 +11,7 @@
   v2 telemetry row adds `warnings: ["content_type_mismatch"]` only when there is one (see docs/telemetry.md); rows
   without warnings are unchanged. The price is recorded in `prices.json` as for any `ok` call.
 - It stays a failure when the answer has the shape of an error rather than of content: an HTML page, by its
-  `Content-Type` or its first bytes (new reason `html_body`), where HTML was not declared; an undeclared
+  `Content-Type` or its first bytes (new reason `html_body`), where HTML was not declared (an HTML label over a body that parses as JSON is JSON mislabelled: a warning); an undeclared
   `application/problem+json` document; a body that should be JSON and does not parse (`body_not_json`, now also for
   broken JSON labelled as another type or sent with no header). The JSON family (`application/json`, `text/json`, any
   `+json` type) is one format: a declared `application/vnd.api+json` answered with `application/json` passes without
