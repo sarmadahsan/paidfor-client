@@ -1,6 +1,6 @@
 # Telemetry
 
-Telemetry is **on by default** (since the release after 0.6.0; issue
+Telemetry is **on by default** (since 0.7.0; issue
 [sarmadahsan/paidfor-index#41](https://github.com/sarmadahsan/paidfor-index/issues/41)): `safeFetch` sends a v2 row,
 the v1 fields plus a proof of payment (see "Version 2"). Only a team account on a paid plan can turn it off, on its
 account page; the server says so in each `/v1/team/authorize` answer (`telemetry.report: "off"`). `telemetry:
@@ -35,7 +35,7 @@ No account and no key are needed to send it.
 | `amount_usdc` | Amount of the signed authorization as a 6-decimal string. `"0.000000"` when nothing was signed. |
 | `latency_ms` | Wall time of the call in milliseconds, rounded. |
 | `validator_failures` | Names of the validators that failed, for example `["http_status"]`. Names only, no evidence. |
-| `client` | `x402-safe-fetch/<version>`, for example `x402-safe-fetch/0.6.0`. |
+| `client` | `x402-safe-fetch/<version>`, for example `x402-safe-fetch/0.7.0`. |
 
 ## What is never sent (v1)
 

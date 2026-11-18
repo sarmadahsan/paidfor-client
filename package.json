@@ -1,6 +1,6 @@
 {
   "name": "@paidfor/x402-safe-fetch",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Drop-in wrapper around @x402/fetch that refuses overpriced quotes and bad sellers, never pays twice for one intent, and checks what it bought.",
   "type": "module",
   "license": "MIT",
