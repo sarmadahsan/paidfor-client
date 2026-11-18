@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
-> **Upgrading turns reporting on.** Until 0.6.0 `telemetry` was `"off"` by default and a from-code payment told the
+> **Upgrading turns reporting on.** Through 0.6.0 `telemetry` was `"off"` by default and a from-code payment told the
 > index nothing. From this release, every priced call reports its outcome to the index with its proof of payment
 > (the v2 row in docs/telemetry.md: payer, nonce, pay-to, tx hash; never bodies, request parameters, IP or identity),
 > with no options. If you used the default, you start reporting when you upgrade. Issue
