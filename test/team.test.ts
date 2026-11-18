@@ -634,6 +634,23 @@ describe("team mode: reporting to the index follows the account (issue 41)", () 
     expect(mock.st.telemetry).toEqual([]);
   });
 
+  it("a format warning (issue 40) is reported as ok with its code when reporting is on, and dropped when the account says off", async () => {
+    mock.st.mode = "markdown";
+    authorizeAnswer = approve(FREE);
+    const on = await client()(`${mock.base}/v1/article`, {}, { intentId: "fmt-on" });
+    expect(on.receipt).toMatchObject({ outcome: "ok", reported_outcome: "ok" });
+    expect(on.receipt.warnings?.map((w) => w.code)).toEqual(["content_type_mismatch"]);
+    await settle();
+    expect(mock.st.telemetry).toEqual([expect.objectContaining({ v: 2, outcome: "ok", warnings: ["content_type_mismatch"], proof: expect.any(Object) })]);
+    mock.st.telemetry.length = 0;
+    authorizeAnswer = approve(PAID_OFF);
+    const off = await client()(`${mock.base}/v1/article`, {}, { intentId: "fmt-off" });
+    expect(off.receipt.warnings?.map((w) => w.code)).toEqual(["content_type_mismatch"]);
+    expect(off.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
   it("the server cannot be asked: nothing is paid, and the next refusal reports", async () => {
     const f = client();
     authorizeAnswer = approve(PAID_OFF);

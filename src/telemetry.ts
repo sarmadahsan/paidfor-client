@@ -58,6 +58,11 @@ export interface TelemetryPayloadV2 {
   proof?: TelemetryProof;
   /** The plain URL path (no query string or fragment), only when the index answered `unknown` for this seller. */
   path?: string;
+  /**
+   * Warnings that did not fail the call (0.7.0), only when there are any: `content_type_mismatch` (usable content in
+   * another format than the seller declared) or `missing_content_type`. Codes only, no evidence.
+   */
+  warnings?: string[];
 }
 
 /** Longest path sent; a longer one is left out rather than risk the row. */
@@ -78,6 +83,8 @@ export function buildPayloadV2(i: {
   proof: TelemetryProof | null;
   /** The pre-pay index check answered `unknown`: send the plain path for this call. */
   unknownSeller?: boolean;
+  /** Warning codes from the receipt; the field is sent only when there is at least one. */
+  warnings?: readonly string[];
 }): TelemetryPayloadV2 {
   const p: TelemetryPayloadV2 = {
     ...buildPayload({ ...i, outcome: i.outcome }),
@@ -89,6 +96,7 @@ export function buildPayloadV2(i: {
     const path = plainPath(i.url);
     if (path) p.path = path;
   }
+  if (i.warnings?.length) p.warnings = [...i.warnings];
   return p;
 }
 

@@ -7,6 +7,7 @@ import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import type { ValidatorName } from "./taxonomy.js";
 import type { TeamReceipt } from "./team.js";
 import type { SettlementResponse } from "./x402/types.js";
+import { isFormatWarning } from "./validators/content_type.js";
 import type { ValidatorResult } from "./validators/types.js";
 
 export type Outcome =
@@ -22,6 +23,21 @@ export type Outcome =
   | "payment_rejected"
   | "replayed"
   | "error";
+
+/**
+ * Something the caller should know about a call that did not fail it (0.7.0). Today only the format rule: the paid
+ * answer is usable but in another format than the seller declared (`content_type_mismatch`), or carried no
+ * Content-Type header (`missing_content_type`). The outcome stays `ok`.
+ */
+export interface ReceiptWarning {
+  code: "content_type_mismatch" | "missing_content_type";
+  validator: ValidatorName;
+  /** The media type the seller declared in its 402; null when it declared none (application/json was expected). */
+  declared: string | null;
+  /** The media type of the response; null when it had no Content-Type header. */
+  received: string | null;
+  message: string;
+}
 
 export interface Receipt {
   v: 1;
@@ -64,6 +80,8 @@ export interface Receipt {
   index_note: string | null;
   validators: Partial<Record<ValidatorName, ValidatorResult>>;
   validator_failures: ValidatorName[];
+  /** Warnings that did not fail the call (0.7.0; absent on older receipts). See ReceiptWarning. */
+  warnings?: ReceiptWarning[];
   settlement: { header: string | null; version: 1 | 2 | null; parsed: SettlementResponse | null; parse_error: string | null };
   tx_hash: string | null;
   nonce: string | null;
@@ -97,6 +115,26 @@ export interface Receipt {
    * `outcome_report` is filled in after the receipt file is written, so it is on the returned receipt only.
    */
   team?: TeamReceipt;
+}
+
+/** The receipt's `warnings` from the validator results: a content_type pass with a format warning. */
+export function receiptWarnings(results: Partial<Record<ValidatorName, ValidatorResult>>): ReceiptWarning[] {
+  const out: ReceiptWarning[] = [];
+  const ct = results.content_type;
+  if (isFormatWarning(ct)) {
+    const declared = ct.evidence.expected_source === "requirements" && typeof ct.evidence.expected === "string" ? ct.evidence.expected : null;
+    const received = typeof ct.evidence.actual === "string" ? ct.evidence.actual : null;
+    const want = declared ? `the seller declared ${declared}` : "the seller declared no type (application/json was expected)";
+    const got = received ? `the response is ${received}` : "the response has no Content-Type header";
+    out.push({
+      code: ct.reason,
+      validator: "content_type",
+      declared,
+      received,
+      message: `${want} and ${got}; the content is returned as sent and the call is not counted as a failure`,
+    });
+  }
+  return out;
 }
 
 /** One JSON file per call: <receiptsDir>/<timestamp>-<random>.json. Returns the file name. */

@@ -11,7 +11,7 @@ When it is on, each call that received an HTTP 402 sends one JSON object to `POS
 (by default `https://paidfor.dev/v1/telemetry`). That object is the whole message. Nothing else is sent.
 No account and no key are needed to send it.
 
-## The exact payload (v1, `"anonymous"`)
+## The exact payload (v1, `"anonymous"` up to 0.6.0)
 
 ```json
 {
@@ -112,12 +112,33 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | --- | --- |
 | `duplicate` | More than one settlement observed for one intent. The client sends one paid request per intent, so in practice it never sees this. |
 | `error` | The settlement header says `success: false` and the answer was neither 2xx nor 402: the seller rejected the payment (the harness's `not_paid`). Proof is still sent, so the index can confirm nothing moved. A 402 with no settlement, or with `success: false`, is `payment_rejected` on the receipt and sends no row (0.6.0). |
-| `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. |
+| `non_delivery` | A non-2xx answer after the payment (even with `http_status` turned off), or `non_empty`, `content_type` or `not_truncated` failed. `content_type` fails only on an HTML page or an undeclared `application/problem+json` document where another type was declared, or on JSON that does not parse; usable content in another format is `ok` with a warning (below). |
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
 | `ok` | None of the above. |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** A refusal by the `authorize` option (`refused_authorize` on the receipt) sends no row at all. |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
+
+### `warnings` (0.7.0): usable content in another format than declared
+
+A paid answer whose content is usable but whose format differs from the one the seller declared in its 402, or that
+has no `Content-Type` header, is `ok`, not `non_delivery`. Its v2 row adds one field, only when there is a warning:
+
+```json
+"outcome": "ok",
+"validator_failures": [],
+"warnings": ["content_type_mismatch"]
+```
+
+| Code | When |
+| --- | --- |
+| `content_type_mismatch` | The response's media type differs from the declared one (or from `application/json` when the seller declared none), and the body is not an HTML page, an undeclared `application/problem+json` document or JSON that fails to parse. Parameters and `+json` suffixes are the same format. |
+| `missing_content_type` | The response had no `Content-Type` header, and the body is usable by the same test. |
+
+Codes only: the declared and received types stay in the receipt (`receipt.warnings`), never in the row. A row without
+warnings has no `warnings` field, exactly as before. The index counts these rows as delivered (in the denominator, not
+in the failures) and shows them on the seller's page as their own observation. An index that predates the field answers 400 to a row that carries it (the client sends it to whatever `indexUrl` is set), so this release is published only after paidfor.dev accepts the field. v1
+rows (`"anonymous"` up to 0.6.0; `safeFetch` no longer sends them) carry no warnings: the call is simply `ok`.
 
 ### `path` (0.2.1): only for sellers the index has never measured
 
@@ -133,7 +154,7 @@ the URL path exactly as it was hashed for `path_hash` (no query string, no fragm
 the host and path of a verified payment to such a seller on its candidate list (`GET {indexUrl}/candidates`) so
 it can buy the seller itself at its next scheduled run, and drops the path from the stored row once the payment
 is checked. These are public API endpoints; the index already saw the same origin and path in the pre-pay
-lookup. `"anonymous"` (v1) never sends it.
+lookup. A v1 row (`"anonymous"` up to 0.6.0) never carried it.
 
 `validator_failed` stays a v1-only outcome. The payer address, amount and pay-to are public on-chain for every
 settled payment; the v2 row adds the link from that payment to the seller host, path hash, outcome, validator
