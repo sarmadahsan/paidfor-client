@@ -64,7 +64,7 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 | Paying twice for the same `intentId`, across restarts and concurrent processes | Duplicates when each retry uses a new `intentId` (pass a stable one) |
 | Re-signing after a timeout or crash once a payment was signed | Recovering that money: the call fails with the nonce so you can check the chain |
 | Non-USDC assets, other networks, non-`exact` schemes, and redirects of the paid request | A seller that settles and then serves wrong or stale content that still passes the four validators |
-| Silent non-delivery: a paid 4xx/5xx, empty, wrong content type or truncated body is flagged in the receipt | Getting the money back: validators report failures, they do not refund or dispute |
+| Silent non-delivery: a paid 4xx/5xx, empty or truncated body, or an HTML page in place of the declared type, is flagged in the receipt | Getting the money back: validators report failures, they do not refund or dispute |
 
 ## Outcomes
 
@@ -72,8 +72,8 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 
 | `outcome` | What happened | `paid` | Returned or thrown |
 | --- | --- | --- | --- |
-| `ok` | Paid, and every validator passed. | `true` | Returned |
-| `validator_failed` | Paid, and a validator failed (a non-2xx answer, an empty or truncated body, the wrong content type). | `true` | Returned |
+| `ok` | Paid, and every validator passed. A usable answer in another format than the seller declared is `ok` with a warning in `warnings` (0.7.0). | `true` | Returned |
+| `validator_failed` | Paid, and a validator failed (a non-2xx answer, an empty or truncated body, an HTML or error page in place of the declared type, JSON that does not parse). | `true` | Returned |
 | `payment_rejected` (0.6.0) | The signed payment was sent and the seller answered HTTP 402 again, with no settlement header or one saying it failed: usually a wallet without enough USDC. Nothing settled. | `false` | Returned (status 402) |
 | `paid_no_response` | Signed and maybe sent, and no response came back. | `true` if sent | Thrown |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | Refused before signing. | `false` | Thrown |
@@ -81,6 +81,26 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 | `no_payment_required` | The resource answered without a 402. | `false` | Returned |
 | `replayed` | The stored result of an earlier call with this `intentId`. | `false` | Returned |
 | `error` | Anything else before signing (network, SDK). | `false` | Thrown |
+
+### Format warnings (0.7.0)
+
+A paid answer whose content is usable but whose format differs from what the seller declared in its 402 (the seller
+declares `application/json` and sends the article as `text/markdown`, or JSON labelled `text/plain`), or that has no
+`Content-Type` header, is not a failed delivery. The receipt's outcome is `ok`, the `content_type` validator says
+`pass` with `reason` `content_type_mismatch` (or `missing_content_type`) and `evidence.warning: true`, and
+`receipt.warnings` says it in words:
+
+```json
+[{ "code": "content_type_mismatch", "validator": "content_type", "declared": "application/json", "received": "text/markdown",
+   "message": "the seller declared application/json and the response is text/markdown; the content is returned as sent and the call is not counted as a failure" }]
+```
+
+It stays a failure (`validator_failed`) when the answer has the shape of an error rather than of content: an HTML page
+(by its `Content-Type` or its first bytes) where HTML was not declared (an HTML label over a body that parses as JSON is
+JSON mislabelled, so a warning), an undeclared `application/problem+json`
+document, or a body that should be JSON and does not parse. A different `+json` type or parameters (`; charset=utf-8`)
+are the same format and raise no warning. A seller that declares no type is judged against `application/json`.
+Empty, truncated and non-2xx answers fail as before.
 
 ### When the seller rejects the payment
 

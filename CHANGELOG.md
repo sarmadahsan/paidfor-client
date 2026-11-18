@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Usable content in another format than declared is a warning, not a failed delivery** (paidfor-index issue 40).
+  When the seller declares one type and answers with usable content in another (`application/json` declared, the
+  article sent as `text/markdown`; JSON labelled `text/plain`), or with no `Content-Type` header, the receipt's
+  outcome is now `ok` (it was `validator_failed`), `reported_outcome` is `ok` (it was `non_delivery`), and the
+  `content_type` validator says `pass` with `reason` `content_type_mismatch` or `missing_content_type` and
+  `evidence.warning: true`. New receipt field `warnings` says it in words, with the declared and received types. The
+  v2 telemetry row adds `warnings: ["content_type_mismatch"]` only when there is one (see docs/telemetry.md); rows
+  without warnings are unchanged. The price is recorded in `prices.json` as for any `ok` call.
+- It stays a failure when the answer has the shape of an error rather than of content: an HTML page, by its
+  `Content-Type` or its first bytes (new reason `html_body`), where HTML was not declared (an HTML label over a body that parses as JSON is JSON mislabelled: a warning); an undeclared
+  `application/problem+json` document; a body that should be JSON and does not parse (`body_not_json`, now also for
+  broken JSON labelled as another type or sent with no header). The JSON family (`application/json`, `text/json`, any
+  `+json` type) is one format: a declared `application/vnd.api+json` answered with `application/json` passes without
+  a warning (it failed before). Empty, truncated and non-2xx answers fail as before.
+- New exports: `WARNING_REASONS` and `isFormatWarning` (validators), `ReceiptWarning` and `receiptWarnings` (receipt).
+  All additive; older receipts have no `warnings` field.
+
 ## 0.6.0
 
 - **A payment the seller rejects is no longer recorded as paid.** When the paid request is answered with HTTP 402

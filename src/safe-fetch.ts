@@ -21,7 +21,7 @@ import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
 import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
-import { writeReceipt, type Outcome, type Receipt } from "./receipt.js";
+import { receiptWarnings, writeReceipt, type Outcome, type Receipt } from "./receipt.js";
 import { PROJECT_RULE, TEAM_ORIGIN, TeamClient, cleanProject, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt, type TeamRefusalReason } from "./team.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
 import { CLIENT_ID, buildPayload, buildPayloadV2, sendTelemetry } from "./telemetry.js";
@@ -376,6 +376,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
               amountUsdc: r.amount_usdc,
               latencyMs: r.latency_ms,
               validatorFailures: failureLabels(r.validator_failures, r.response?.status),
+              warnings: (r.warnings ?? []).map((w) => w.code),
               proof: r.proof,
               unknownSeller: r.index_note === UNKNOWN_SELLER_NOTE,
             })
@@ -448,6 +449,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       index_note: null,
       validators: {},
       validator_failures: [],
+      warnings: [],
       settlement: { header: null, version: null, parsed: null, parse_error: null },
       tx_hash: null,
       nonce: null,
@@ -489,6 +491,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       r.seller = original.seller;
       r.validators = original.validators;
       r.validator_failures = original.validator_failures;
+      if (original.warnings) r.warnings = original.warnings;
       r.tx_hash = original.tx_hash;
       r.nonce = original.nonce;
       r.payer = original.payer ?? null;
@@ -872,6 +875,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     );
     r.validators = results;
     r.validator_failures = (Object.entries(results) as [ValidatorName, { status: string }][]).filter(([, v]) => v.status === "fail").map(([k]) => k);
+    r.warnings = receiptWarnings(results);
     r.response = {
       status: res.status,
       content_type: res.headers.get("content-type"),

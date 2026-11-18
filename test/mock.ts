@@ -17,7 +17,7 @@ export function fixture(name: string): unknown {
   return JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8"));
 }
 
-export type SellerMode = "ok" | "conway_500" | "big" | "hang" | "offnet" | "free" | "settle_fail" | "reject_402" | "reject_garbled";
+export type SellerMode = "ok" | "conway_500" | "big" | "hang" | "offnet" | "free" | "settle_fail" | "reject_402" | "reject_garbled" | "markdown" | "html_200";
 export type IndexMode = { kind: "json"; body: unknown } | { kind: "status"; status: number } | { kind: "hang" };
 
 export interface MockState {
@@ -149,6 +149,15 @@ async function handler(st: MockState, req: IncomingMessage, res: ServerResponse)
     case "offnet":
       res.writeHead(200, { "content-type": "application/json", [HEADERS.V2_RESPONSE]: encodeHeaderJson(settle) });
       res.end(JSON.stringify({ ok: true, credits: 100 }));
+      return;
+    case "markdown":
+      // Declares application/json in its 402 and answers with the article as markdown (aiact-api.com, issue 40).
+      res.writeHead(200, { "content-type": "text/markdown; charset=utf-8", [HEADERS.V2_RESPONSE]: encodeHeaderJson(settle) });
+      res.end("# Article 5\n\nProhibited AI practices: the full text of the article.");
+      return;
+    case "html_200":
+      res.writeHead(200, { "content-type": "text/html", [HEADERS.V2_RESPONSE]: encodeHeaderJson(settle) });
+      res.end("<!doctype html><html><body>Service temporarily unavailable</body></html>");
       return;
     case "conway_500":
       // Conway auto-top-up: the seller settles the payment, then fails the request.
