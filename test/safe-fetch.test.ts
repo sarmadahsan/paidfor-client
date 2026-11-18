@@ -140,6 +140,22 @@ describe("safeFetch: refusals (nothing signed)", () => {
     expect(warnings.join("\n")).toMatch(/caution/);
   });
 
+  it("says nothing about paying a 'caution' seller when a later check refuses the payment (e2e issue 45)", async () => {
+    indexAnswer("check-caution-listed", { resource: { listed_price_usdc: "0.005000" } }); // quote 0.010000 = 2x
+    const err = (await client()(`${mock.base}/data`).catch((e: unknown) => e)) as PaymentRefusedError;
+    expect(err.code).toBe("refused_ratio");
+    expect(mock.st.paidCount).toBe(0);
+    expect(warnings.filter((w) => w.includes('rates "caution"'))).toEqual([]);
+  });
+
+  it("says nothing about paying a 'caution' seller that the authorize hook declines", async () => {
+    indexAnswer("check-caution-listed", { resource: { listed_price_usdc: "0.010000" } });
+    const err = (await client({ authorize: async () => ({ approve: false, message: "no" }) })(`${mock.base}/data`).catch((e: unknown) => e)) as PaymentRefusedError;
+    expect(err.code).toBe("refused_authorize");
+    expect(mock.st.paidCount).toBe(0);
+    expect(warnings.filter((w) => w.includes('rates "caution"'))).toEqual([]);
+  });
+
   it("refuses a quote more than 10% over the index listed price", async () => {
     indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.009000" } }); // quote 0.010000 = 1.11x
     const err = (await client()(`${mock.base}/data`).catch((e: unknown) => e)) as PaymentRefusedError;
@@ -561,17 +577,17 @@ describe("safeFetch: Conway auto-top-up (paid, 500, retried every 60 s)", () => 
 describe("safeFetch: telemetry", () => {
   it("with no options, posts the verified v2 row with its proof, fire-and-forget, and swallows the 404", async () => {
     indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.010000" } });
-    const res = await client()(`${mock.base}/data?secret=abc`, {}, { intentId: "tel-1" });
+    const res = await client()(`${mock.base}/data?secret=qzxw`, {}, { intentId: "tel-1" });
     expect(res.status).toBe(200);
     expect(res.receipt.verification_url).toMatch(/\/v1\/telemetry\/0x[0-9a-f]{40}\/0x[0-9a-f]{64}$/);
     await new Promise((r) => setTimeout(r, 200));
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "proof", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 2, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.7.0", proof: { payer: account.address.toLowerCase() } });
+    expect(p).toMatchObject({ v: 2, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.7.1", proof: { payer: account.address.toLowerCase() } });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
-    for (const leak of ["secret", "abc", "tel-1"]) expect(raw).not.toContain(leak);
+    for (const leak of ["secret", "qzxw", "tel-1"]) expect(raw).not.toContain(leak);
     const log = await readFile(join(dir, "debug.log"), "utf8");
     expect(log).toMatch(/telemetry_failed count=\d+ http 404/);
   });
@@ -676,7 +692,7 @@ describe("safeFetch: verified telemetry (v2)", () => {
   it("posts a v2 row that matches the contract example field by field", async () => {
     mock.st.mode = "conway_500";
     indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.010000" } });
-    const res = await client({ telemetry: "verified" })(`${mock.base}/credits/topup/?secret=abc`, { method: "POST", body: '{"account":"acct_42"}' }, { intentId: "v2-1" });
+    const res = await client({ telemetry: "verified" })(`${mock.base}/credits/topup/?secret=qzxw`, { method: "POST", body: '{"account":"acct_42"}' }, { intentId: "v2-1" });
     expect(res.status).toBe(500);
     await settle();
     expect(mock.st.telemetry).toHaveLength(1);
@@ -713,7 +729,7 @@ describe("safeFetch: verified telemetry (v2)", () => {
 
     // Bodies, query strings, request parameters and the intent id never leave the machine.
     const raw = JSON.stringify(body);
-    for (const leak of ["secret", "abc", "acct_42", "internal error", "v2-1"]) expect(raw).not.toContain(leak);
+    for (const leak of ["secret", "qzxw", "acct_42", "internal error", "v2-1"]) expect(raw).not.toContain(leak);
   });
 
   it("writes proof and verification_url into the receipt, and replays carry them", async () => {

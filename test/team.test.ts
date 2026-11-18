@@ -134,6 +134,47 @@ describe("team mode: approve", () => {
     expect(res.receipt.team?.usage).toEqual({ day_usd: "4.00" });
   });
 
+  // The words and shape paidfor's server sends (lib/team/usage.ts planWarnings) for a second wallet on a Free account.
+  const EXTRA_WALLET = {
+    code: "extra_wallet",
+    message: "This wallet is past the 1 active wallet the Free plan covers for 2026-11. Limits are not enforced yet, so nothing changes for now.",
+    upgrade_url: "https://paidfor.dev/pricing",
+  };
+  const USAGE = { plan: "free", month: "2026-11", payments: 26, payments_included: 1000, active_wallets: 2, wallets_included: 1, enforced: false };
+
+  it("carries the server's plan warning on the receipt of an approved payment, as the server sent it", async () => {
+    authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later(), ledger_id: "led_1", usage: USAGE, warnings: [EXTRA_WALLET], telemetry: { report: "verified" } } });
+    const res = await client()(`${mock.base}/x`);
+    expect(res.receipt.paid).toBe(true);
+    expect(res.receipt.team?.warnings).toEqual([EXTRA_WALLET]);
+    expect(res.receipt.team?.usage).toEqual(USAGE);
+    // And in the receipt written to disk.
+    const files = (await readdir(dir)).filter((n) => n.endsWith(".json") && n !== "prices.json");
+    const onDisk = await Promise.all(files.map(async (f) => JSON.parse(await readFile(join(dir, f), "utf8")) as { team?: { warnings: unknown } }));
+    expect(onDisk.map((r) => r.team?.warnings)).toContainEqual([EXTRA_WALLET]);
+  });
+
+  it("reads warnings as @paidfor/mcp does: a message with no code counts, control characters become spaces", async () => {
+    authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later(), warnings: [{ message: "Budget\nnearly used." }, { code: "x", message: "" }, { code: "quota_80", message: " 80% used. " }] } });
+    const res = await client()(`${mock.base}/x`);
+    expect(res.receipt.team?.warnings).toEqual([
+      { code: "warning", message: "Budget nearly used." },
+      { code: "quota_80", message: "80% used." },
+    ]);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["a decline", { decision: "decline", reason: "seller_caution_not_allowed", message: "This seller is rated caution." }],
+    ["a payment waiting for a person", { decision: "needs_approval", approve_url: "https://paidfor.dev/team/approve/ab12", expires_at: "2026-11-10T12:30:00Z", message: "Over $0.50." }],
+  ])("carries the server's warnings on the receipt of %s, which pays nothing", async (_n, body) => {
+    authorizeAnswer = () => ({ status: 200, body: { ...body, usage: USAGE, warnings: [EXTRA_WALLET] } });
+    const err = (await client()(`${mock.base}/x`).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err).toBeInstanceOf(TeamRefusedError);
+    expect(err.decision.warnings).toEqual([EXTRA_WALLET]);
+    expect(err.receipt?.team?.warnings).toEqual([EXTRA_WALLET]);
+    expect(mock.st.paidCount).toBe(0);
+  });
+
   it("reports a paid call the seller failed (paid, with the outcome the receipt names)", async () => {
     mock.st.mode = "conway_500";
     const res = await client()(`${mock.base}/x`);
@@ -406,6 +447,38 @@ describe("team mode: a payment the seller rejects", () => {
       { wallet: account.address, intent_id: "two", auth_ref: REF, paid: false },
       { wallet: account.address, intent_id: "two", auth_ref: other, paid: false },
     ]);
+  });
+});
+
+describe('team mode: the "caution" line (paidfor-index e2e issue 45)', () => {
+  const caution = () => {
+    mock.st.index = { kind: "json", body: { ...(fixture("check-caution-listed") as Record<string, unknown>), host: "127.0.0.1", seller_url: "https://paidfor.dev/seller/127.0.0.1", resource: { listed_price_usdc: "0.010000" } } };
+  };
+  const cautionLines = () => warnings.filter((w) => w.includes('rates "caution"'));
+
+  it("says nothing about paying a caution seller the account declines", async () => {
+    caution();
+    authorizeAnswer = () => ({ status: 200, body: { decision: "decline", reason: "seller_caution_not_allowed", message: "This seller is rated caution and is not on this wallet's trusted list." } });
+    const err = (await client()(`${mock.base}/data`).catch((e: unknown) => e)) as TeamRefusedError;
+    expect(err).toBeInstanceOf(TeamRefusedError);
+    expect(err.receipt?.seller.verdict).toBe("caution");
+    expect(mock.st.paidCount).toBe(0);
+    expect(cautionLines()).toEqual([]);
+  });
+
+  it("says nothing while a person has still to approve it", async () => {
+    caution();
+    authorizeAnswer = () => ({ status: 200, body: { decision: "needs_approval", approve_url: "https://paidfor.dev/team/approve/ab12", expires_at: "2026-11-10T12:30:00Z", message: "" } });
+    await expect(client()(`${mock.base}/data`)).rejects.toBeInstanceOf(TeamRefusedError);
+    expect(cautionLines()).toEqual([]);
+  });
+
+  it("says it once when the account approves and the payment goes ahead", async () => {
+    caution();
+    const res = await client()(`${mock.base}/data`);
+    expect(res.receipt.paid).toBe(true);
+    expect(cautionLines()).toHaveLength(1);
+    expect(cautionLines()[0]).toMatch(/^x402-safe-fetch: paying 127\.0\.0\.1, which paidfor\.dev rates "caution"/);
   });
 });
 

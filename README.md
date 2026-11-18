@@ -21,7 +21,7 @@ import { safeFetch } from "@paidfor/x402-safe-fetch";
 const fetchWithPay = safeFetch(walletClient, {
   maxPerCallUsd: 0.50,
   maxOverListedRatio: 1.1,     // refuse quotes more than 10% above the listed/known price
-  refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed but logged
+  refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed, and logged when it is paid
   indexUrl: "https://paidfor.dev/v1",
   validators: ["http_status", "non_empty", "content_type", "not_truncated"],
   // Reporting to the index is on by default; only a paid team account turns it off (see Telemetry).
@@ -284,8 +284,11 @@ What you get:
 - Every approval's outcome, paid or not, is reported to the team's ledger. A report the server could not take is
   kept in `<receiptsDir>/team-outcomes` and sent before the next payment (in memory, until the process ends, if
   the disk cannot take it).
-- `receipt.team` says what the team decided, carries any `warnings` the server sent, and `outcome_report` (`sent`,
-  `queued` or `rejected`).
+- `receipt.team` says what the team decided, carries any `warnings` the server sent (a plan quota, a wallet past
+  what the plan covers; on a decline or a payment waiting for a person too, and on `TeamRefusedError`'s receipt), and
+  `outcome_report` (`sent`, `queued` or `rejected`).
+- A seller rated `caution` is logged (`paying <host>, which paidfor.dev rates "caution"`) only once the team has
+  approved the payment and it is about to be signed; a caution seller the team declines logs nothing.
 
 - A payment this client refuses by itself before asking the team (`refused_verdict`, `refused_ratio`,
   `refused_max_per_call`) is told to the team (`POST {origin}/v1/team/refusals`, with the quote, the reason and the

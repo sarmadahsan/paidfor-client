@@ -35,7 +35,7 @@ No account and no key are needed to send it.
 | `amount_usdc` | Amount of the signed authorization as a 6-decimal string. `"0.000000"` when nothing was signed. |
 | `latency_ms` | Wall time of the call in milliseconds, rounded. |
 | `validator_failures` | Names of the validators that failed, for example `["http_status"]`. Names only, no evidence. |
-| `client` | `x402-safe-fetch/<version>`, for example `x402-safe-fetch/0.7.0`. |
+| `client` | `x402-safe-fetch/<version>`, for example `x402-safe-fetch/0.7.1`. |
 
 ## What is never sent (v1)
 

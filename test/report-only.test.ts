@@ -36,7 +36,7 @@ describe("report-only: the row", () => {
       amount_usdc: "0.010000",
       latency_ms: 0,
       validator_failures: ["http_status:500"],
-      client: "x402-safe-fetch/0.7.0",
+      client: "x402-safe-fetch/0.7.1",
       proof: { network: "eip155:8453", tx_hash: TX },
     });
     expect(JSON.stringify(p)).not.toContain("symbol");
@@ -68,7 +68,7 @@ describe("withPaidforReporting (x402-fetch, @x402/fetch)", () => {
     await f(URL_);
     await tick();
     expect(ix.posts).toHaveLength(1);
-    expect(ix.posts[0]).toMatchObject({ url: "https://paidfor.dev/v1/telemetry", headers: { "X-Paidfor-Client": "x402-safe-fetch/0.7.0" }, body: { outcome: "ok", proof: { tx_hash: TX } } });
+    expect(ix.posts[0]).toMatchObject({ url: "https://paidfor.dev/v1/telemetry", headers: { "X-Paidfor-Client": "x402-safe-fetch/0.7.1" }, body: { outcome: "ok", proof: { tx_hash: TX } } });
   });
 
   it("reports a paid non-2xx as non_delivery, sends nothing for a free call, and never throws when the index is down", async () => {

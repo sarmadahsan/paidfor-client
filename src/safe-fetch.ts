@@ -49,7 +49,7 @@ export interface SafeFetchOptions {
   maxPerCallUsd: number;
   /** Refuse quotes above reference * ratio. Default 1.1. */
   maxOverListedRatio?: number;
-  /** Seller verdicts that block payment. Default ["avoid"]. "caution" is logged when not listed here. */
+  /** Seller verdicts that block payment. Default ["avoid"]. "caution", when not listed here, is logged once every check (and the approval) let the payment go ahead. */
   refuseVerdicts?: Exclude<Verdict, "unknown">[];
   /** paidfor index base URL. Default "https://paidfor.dev/v1". `false` skips the index entirely. */
   indexUrl?: string | false;
@@ -668,9 +668,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         };
         return { abort: true, reason: refusal.message };
       }
-      if (i.available && i.verdict === "caution") {
-        warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
-      }
+      // A "caution" seller is said once every check below, and the approval in team mode, has let the payment go ahead:
+      // said here, it would be false whenever one of them then refuses (paidfor-index e2e issue 45).
 
       // 2. Quote vs reference: index listed price, else the last price this client paid for the resource.
       let ref: { amount: bigint; source: ReferenceSource } | undefined;
@@ -775,6 +774,9 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       } catch (e) {
         failure = { code: "sdk", message: `could not record intent before signing: ${errMsg(e)}` };
         return { abort: true, reason: failure.message };
+      }
+      if (i.available && i.verdict === "caution") {
+        warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
       }
       return undefined;
     });
