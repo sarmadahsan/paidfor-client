@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { PaymentRefusedError, TeamClient, TeamRefusedError, readDecision, safeFetch, type SafeFetchOptions, type TeamDecision } from "../src/index.js";
+import { resetOnceNotices } from "../src/safe-fetch.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
 import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
 
@@ -42,6 +43,7 @@ beforeEach(async () => {
   delete process.env.PAIDFOR_TEAM_KEY;
   delete process.env.PAIDFOR_PROJECT;
   mock.reset();
+  resetOnceNotices();
   warnings.length = 0;
   requests = [];
   authorizeAnswer = () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later(), ledger_id: "led_1", intent_id: "x", verdict: "ok", seller: "127.0.0.1", usd: "0.01", replayed: false } });
@@ -51,7 +53,8 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await chmod(join(dir, "team-outcomes"), 0o700).catch(() => undefined);
-  await rm(dir, { recursive: true, force: true });
+  // Reporting is on by default: a fire-and-forget row may still be writing debug.log when a test ends.
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 const account = privateKeyToAccount(generatePrivateKey());
@@ -81,7 +84,7 @@ function client({ noTeam, ...o }: Partial<SafeFetchOptions> & { noTeam?: boolean
     indexUrl: `${mock.base}/v1`,
     receiptsDir: dir,
     network: NETWORK,
-    telemetry: "off",
+    telemetryNotice: false,
     fetch: fakeFetch,
     logger: { warn: (m) => warnings.push(m) },
     ...(noTeam ? {} : { team: { key: KEY, origin: ORIGIN } }),
@@ -528,5 +531,135 @@ describe("team mode: project", () => {
 
   it("accepts the longest tag the server takes", () => {
     expect(() => client({ team: { key: KEY, origin: ORIGIN, project: "x".repeat(64) } })).not.toThrow();
+  });
+});
+
+describe("team mode: reporting to the index follows the account (issue 41)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 200));
+  const approve = (telemetry?: unknown) => () => ({ status: 200, body: { decision: "approve", auth_ref: REF, valid_before: later(), ...(telemetry !== undefined ? { telemetry } : {}) } });
+  const PAID_OFF = { report: "off", opt_out_allowed: true, opted_out: true };
+  const FREE = { report: "verified", opt_out_allowed: false, opted_out: false };
+  const indexAnswer = (name: string) => {
+    mock.st.index = { kind: "json", body: { ...(fixture(name) as Record<string, unknown>), host: "127.0.0.1", seller_url: "https://paidfor.dev/seller/127.0.0.1" } };
+  };
+
+  it("reads the account's answer strictly; anything but report: off means report", () => {
+    const base = { decision: "approve", auth_ref: REF, valid_before: 1 };
+    expect(readDecision({ ...base, telemetry: PAID_OFF }).telemetry).toBe("off");
+    expect(readDecision({ ...base, telemetry: FREE }).telemetry).toBe("verified");
+    for (const t of [undefined, null, "off", { report: "OFF" }, { report: false }, []]) expect(readDecision({ ...base, telemetry: t }).telemetry).toBeUndefined();
+  });
+
+  it("a paid team that turned reporting off sends no row, and says nothing about it", async () => {
+    authorizeAnswer = approve(PAID_OFF);
+    const res = await client()(`${mock.base}/data`);
+    expect(res.status).toBe(200);
+    expect(res.receipt.proof).not.toBeNull();
+    expect(res.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+    // The team's own ledger still hears about it.
+    expect(teamCalls("/v1/team/outcome")).toHaveLength(1);
+    expect(warnings.filter((w) => w.includes("not honoured"))).toEqual([]);
+  });
+
+  it("the account decides even when the code asks for verified", async () => {
+    authorizeAnswer = approve(PAID_OFF);
+    await client({ telemetry: "verified" })(`${mock.base}/data`);
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it('a free team cannot opt out: telemetry: "off" still reports verified rows, and says so once', async () => {
+    authorizeAnswer = approve(FREE);
+    const f = client({ telemetry: "off" });
+    await f(`${mock.base}/data`);
+    await f(`${mock.base}/data`);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(2);
+    for (const row of mock.st.telemetry) expect(row).toMatchObject({ v: 2, proof: { payer: account.address.toLowerCase() } });
+    expect(warnings.filter((w) => w.includes('telemetry: "off" is not honoured'))).toHaveLength(1);
+  });
+
+  it("an older server that sends no telemetry field: report (fail towards reporting)", async () => {
+    authorizeAnswer = approve();
+    const res = await client({ telemetry: "off" })(`${mock.base}/data`);
+    expect(res.receipt.verification_url).toMatch(/\/telemetry\//);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+  });
+
+  it("a refusal before the team is asked follows the last answer, and reports when there was none", async () => {
+    indexAnswer("check-avoid");
+    const f = client();
+    await f(`${mock.base}/data`).catch(() => undefined);
+    await settle();
+    expect(mock.st.telemetry).toEqual([expect.objectContaining({ outcome: "refused_verdict" })]);
+    mock.reset();
+    authorizeAnswer = approve(PAID_OFF);
+    await f(`${mock.base}/data`); // the team answers off
+    indexAnswer("check-avoid");
+    await f(`${mock.base}/data`).catch(() => undefined);
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("an answer that stops saying off (a downgrade) turns reporting back on from that payment", async () => {
+    const f = client();
+    authorizeAnswer = approve(PAID_OFF);
+    await f(`${mock.base}/data`);
+    authorizeAnswer = approve({ report: "verified", opt_out_allowed: false, opted_out: true });
+    await f(`${mock.base}/data`);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+  });
+
+  it("payments in flight at the same time each follow their own answer (one's answer never decides another's row)", async () => {
+    let n = 0;
+    authorizeAnswer = () => (++n === 1 ? approve(PAID_OFF)() : "throw");
+    // A's paid request waits on the seller while B asks the team and gets no answer.
+    const slow: typeof fetch = async (input, init) => {
+      if (new Headers(init?.headers).get("payment-signature")) await new Promise((r) => setTimeout(r, 300));
+      return fakeFetch(input, init);
+    };
+    const f = client({ fetch: slow });
+    const a = f(`${mock.base}/data`, {}, { intentId: "overlap-a" });
+    await new Promise((r) => setTimeout(r, 100));
+    const b = f(`${mock.base}/data`, {}, { intentId: "overlap-b" }).catch((e: unknown) => e);
+    expect(await b).toBeInstanceOf(TeamRefusedError);
+    const res = await a;
+    expect(res.status).toBe(200);
+    expect(res.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("a format warning (issue 40) is reported as ok with its code when reporting is on, and dropped when the account says off", async () => {
+    mock.st.mode = "markdown";
+    authorizeAnswer = approve(FREE);
+    const on = await client()(`${mock.base}/v1/article`, {}, { intentId: "fmt-on" });
+    expect(on.receipt).toMatchObject({ outcome: "ok", reported_outcome: "ok" });
+    expect(on.receipt.warnings?.map((w) => w.code)).toEqual(["content_type_mismatch"]);
+    await settle();
+    expect(mock.st.telemetry).toEqual([expect.objectContaining({ v: 2, outcome: "ok", warnings: ["content_type_mismatch"], proof: expect.any(Object) })]);
+    mock.st.telemetry.length = 0;
+    authorizeAnswer = approve(PAID_OFF);
+    const off = await client()(`${mock.base}/v1/article`, {}, { intentId: "fmt-off" });
+    expect(off.receipt.warnings?.map((w) => w.code)).toEqual(["content_type_mismatch"]);
+    expect(off.receipt.verification_url).toBeNull();
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("the server cannot be asked: nothing is paid, and the next refusal reports", async () => {
+    const f = client();
+    authorizeAnswer = approve(PAID_OFF);
+    await f(`${mock.base}/data`);
+    authorizeAnswer = () => "throw";
+    await expect(f(`${mock.base}/data`)).rejects.toBeInstanceOf(TeamRefusedError);
+    indexAnswer("check-avoid");
+    await f(`${mock.base}/data`).catch(() => undefined);
+    await settle();
+    expect(mock.st.telemetry).toEqual([expect.objectContaining({ outcome: "refused_verdict" })]);
   });
 });

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type AuthorizeRequest, type SafeFetchOptions } from "../src/index.js";
+import { resetOnceNotices } from "../src/safe-fetch.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
 import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
 
@@ -20,10 +21,12 @@ beforeAll(async () => {
 afterAll(() => mock.close());
 beforeEach(async () => {
   mock.reset();
+  resetOnceNotices();
   warnings.length = 0;
   dir = await mkdtemp(join(tmpdir(), "x402-safe-fetch-"));
 });
-afterEach(() => rm(dir, { recursive: true, force: true }));
+// Reporting is on by default: a fire-and-forget row may still be writing debug.log when a test ends.
+afterEach(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
 
 const account = privateKeyToAccount(generatePrivateKey());
 
@@ -35,7 +38,8 @@ function client(o: Partial<SafeFetchOptions> = {}) {
     indexUrl: `${mock.base}/v1`,
     receiptsDir: dir,
     network: NETWORK,
-    telemetry: "off",
+    // Reporting is on by default; the one-time notice is tested on its own below.
+    telemetryNotice: false,
     logger: { warn: (m) => warnings.push(m) },
     ...o,
   });
@@ -555,18 +559,19 @@ describe("safeFetch: Conway auto-top-up (paid, 500, retried every 60 s)", () => 
 });
 
 describe("safeFetch: telemetry", () => {
-  it("posts exactly the outcome payload, fire-and-forget, and swallows the 404", async () => {
+  it("with no options, posts the verified v2 row with its proof, fire-and-forget, and swallows the 404", async () => {
     indexAnswer("check-caution-listed", { verdict: "ok", resource: { listed_price_usdc: "0.010000" } });
-    const res = await client({ telemetry: "anonymous" })(`${mock.base}/data?secret=abc`, {}, { intentId: "tel-1" });
+    const res = await client()(`${mock.base}/data?secret=abc`, {}, { intentId: "tel-1" });
     expect(res.status).toBe(200);
+    expect(res.receipt.verification_url).toMatch(/\/v1\/telemetry\/0x[0-9a-f]{40}\/0x[0-9a-f]{64}$/);
     await new Promise((r) => setTimeout(r, 200));
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
-    expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 1, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.6.0" });
+    expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "proof", "v", "validator_failures"]);
+    expect(p).toMatchObject({ v: 2, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.6.0", proof: { payer: account.address.toLowerCase() } });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
-    for (const leak of ["secret", "abc", "tel-1", account.address.toLowerCase().slice(2), account.address.slice(2)]) expect(raw).not.toContain(leak);
+    for (const leak of ["secret", "abc", "tel-1"]) expect(raw).not.toContain(leak);
     const log = await readFile(join(dir, "debug.log"), "utf8");
     expect(log).toMatch(/telemetry_failed count=\d+ http 404/);
   });
@@ -574,13 +579,33 @@ describe("safeFetch: telemetry", () => {
   it("never delays the purchase when the telemetry route hangs", async () => {
     mock.st.telemetryStatus = "hang";
     const t0 = Date.now();
-    const res = await client({ telemetry: "anonymous" })(`${mock.base}/data`);
+    const res = await client()(`${mock.base}/data`);
     expect(res.status).toBe(200);
     expect(Date.now() - t0).toBeLessThan(800);
   });
 
-  it("sends nothing when telemetry is off", async () => {
-    await client()(`${mock.base}/data`);
+  it.each(["off", "anonymous"] as const)('without an account, telemetry: "%s" is not honoured: verified rows, and one line once', async (asked) => {
+    const f = client({ telemetry: asked });
+    await f(`${mock.base}/data`);
+    await f(`${mock.base}/data`);
+    await client({ telemetry: asked })(`${mock.base}/data`);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(mock.st.telemetry).toHaveLength(3);
+    for (const row of mock.st.telemetry) expect(row).toMatchObject({ v: 2, outcome: "ok", proof: { payer: account.address.toLowerCase() } });
+    const told = warnings.filter((w) => w.includes("is not honoured"));
+    expect(told).toHaveLength(1);
+    expect(told[0]).toBe(`x402-safe-fetch: telemetry: "${asked}" is not honoured: purchase outcomes are reported to the index with their proof of payment, because that is what keeps paidfor free. Only a team account on a paid plan can turn reporting off, on its account page (https://paidfor.dev/team); plans: https://paidfor.dev/pricing. Shown once.`);
+  });
+
+  it("the not-honoured line goes to a telemetryNotice function when one is given", async () => {
+    const got: string[] = [];
+    await client({ telemetry: "off", telemetryNotice: (m) => got.push(m) })(`${mock.base}/data`);
+    expect(got.filter((m) => m.includes('telemetry: "off" is not honoured'))).toHaveLength(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it("indexUrl: false sends nothing (and checks no seller)", async () => {
+    await client({ indexUrl: false })(`${mock.base}/data`);
     await new Promise((r) => setTimeout(r, 100));
     expect(mock.st.telemetry).toEqual([]);
   });
@@ -609,6 +634,13 @@ describe("safeFetch: usable content in another format than declared (issue 40)",
     await settle();
     expect(mock.st.telemetry).toHaveLength(1);
     expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "ok", validator_failures: [], warnings: ["content_type_mismatch"] });
+  });
+
+  it("is reported with its warning code with no options at all (reporting is on by default)", async () => {
+    mock.st.mode = "markdown";
+    await client()(`${mock.base}/v1/article`, {}, { intentId: "fmt-default" });
+    await settle();
+    expect(mock.st.telemetry).toEqual([expect.objectContaining({ v: 2, outcome: "ok", warnings: ["content_type_mismatch"] })]);
   });
 
   it("keeps the warning on a replay", async () => {
@@ -721,13 +753,6 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(known.path_hash).toBe(unknown.path_hash);
   });
 
-  it("anonymous telemetry never sends a path", async () => {
-    indexAnswer("check-unknown");
-    await client({ telemetry: "anonymous" })(`${mock.base}/v1/quote`, {}, { intentId: "u-4" });
-    await settle();
-    expect(mock.st.telemetry[0]).not.toHaveProperty("path");
-  });
-
   it("a refusal sends a v2 row without proof", async () => {
     indexAnswer("check-avoid");
     const f = client({ telemetry: "verified" });
@@ -749,24 +774,15 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "paid_no_response", proof: { tx_hash: null } });
   });
 
-  it('"anonymous" still sends v1 with no proof; the receipt keeps the proof locally', async () => {
-    const res = await client({ telemetry: "anonymous" })(`${mock.base}/data`);
-    expect(res.receipt.proof).not.toBeNull();
-    expect(res.receipt.verification_url).toBeNull();
-    await settle();
-    expect(mock.st.telemetry[0]).toMatchObject({ v: 1, outcome: "ok" });
-    expect(mock.st.telemetry[0]).not.toHaveProperty("proof");
-    expect(JSON.stringify(mock.st.telemetry[0])).not.toContain(account.address.slice(2).toLowerCase());
-  });
-
-  it("prints the privacy notice once per receipts directory", async () => {
-    client({ telemetry: "verified" });
+  it("prints the privacy notice once per receipts directory, with no options too", async () => {
+    client({ telemetryNotice: true });
     await settle();
     expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
-    client({ telemetry: "verified" });
+    expect(warnings[0]).toMatch(/reporting is on: .*a team account on a paid plan can turn it off on its account page/);
+    client({ telemetry: "verified", telemetryNotice: true });
     await settle();
     expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
-    client({ telemetry: "anonymous" });
+    client({ telemetry: "anonymous", telemetryNotice: true });
     expect(warnings).toHaveLength(1);
   });
 
@@ -780,9 +796,9 @@ describe("safeFetch: verified telemetry (v2)", () => {
     await settle();
     expect(warnings).toEqual([]);
     expect(got).toHaveLength(1);
-    expect(got[0]).toMatch(/^x402-safe-fetch: telemetry: "verified" sends .*Shown once\.$/);
+    expect(got[0]).toMatch(/^x402-safe-fetch: reporting is on: each purchase outcome is sent .*Shown once\.$/);
     // Shown once per directory either way.
-    client({ telemetry: "verified" });
+    client({ telemetry: "verified", telemetryNotice: true });
     await settle();
     expect(warnings).toEqual([]);
   });
@@ -792,6 +808,12 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(() => client({ telemetry: "verified", indexUrl: "http://localhost:9/v1" })).not.toThrow();
     expect(() => client({ telemetry: "verified", indexUrl: "https://paidfor.dev/v1" })).not.toThrow();
     expect(() => client({ telemetry: "anonymous", indexUrl: "http://paidfor.dev/v1" })).not.toThrow();
+  });
+
+  it("by default, a plain-http remote indexUrl gets no rows, and one line says so", () => {
+    expect(() => client({ indexUrl: "http://paidfor.dev/v1" })).not.toThrow();
+    client({ indexUrl: "http://paidfor.dev/v1" });
+    expect(warnings.filter((w) => w.includes("nothing is reported to http://paidfor.dev/v1"))).toHaveLength(1);
   });
 
   it("never follows a redirect on the telemetry POST", async () => {

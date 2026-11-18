@@ -3,7 +3,11 @@
 A drop-in wrapper around the official [`@x402/fetch`](https://www.npmjs.com/package/@x402/fetch) client (2.28.x)
 that protects the buyer before and after paying. It refuses overpriced quotes and sellers rated "avoid", never
 pays twice for the same intent, and checks what it bought. No account, no key, nothing to sign up for: not to
-install it, not to read the index, and not to contribute telemetry.
+install it, not to read the index, and not to contribute to it.
+
+**It reports each purchase outcome to the index by default**, with its proof of payment (see
+[Telemetry](#telemetry)). That is the deal that keeps paidfor free: the index is made from these reports. Only a team
+account on a paid plan can turn reporting off.
 
 This is the client-side half of the x402 seller index at [paidfor.dev](https://paidfor.dev).
 
@@ -20,7 +24,7 @@ const fetchWithPay = safeFetch(walletClient, {
   refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed but logged
   indexUrl: "https://paidfor.dev/v1",
   validators: ["http_status", "non_empty", "content_type", "not_truncated"],
-  telemetry: "verified",       // or "anonymous" (no proof of payment) or "off" (the default)
+  // Reporting to the index is on by default; only a paid team account turns it off (see Telemetry).
   receiptsDir: "./.x402-receipts",
 });
 
@@ -51,7 +55,7 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
    id, quote, amount, reference price and its source, seller verdict, validator results, the settlement header,
    and the on-chain tx hash when the header carries it. The same receipt is written to the receipts directory as
    one JSON file per call.
-4. **Telemetry, when enabled.** One POST per call, fire-and-forget. See below.
+4. **Telemetry.** One POST per call to the index, fire-and-forget, on by default. See below.
 
 ## What it blocks and what it does not
 
@@ -143,11 +147,11 @@ the chain, so that check is yours.
   intents/<sha256(intentId)>.json        idempotency state and the stored response
   prices.json                            last price paid per resource (method + origin + path)
   debug.log                              telemetry failures, local only
-  .verified-telemetry-notice             marks that the one-time "verified" notice was shown
+  .verified-telemetry-notice             marks that the one-time reporting notice was shown
 ```
 
-Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, with
-`telemetry: "verified"`, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, which shows
+Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, when the row was
+sent, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, which shows
 whether the index has verified your row on-chain (usually within about five minutes of the payment).
 `reported_outcome` is the outcome under the harness names, as the row reports it.
 
@@ -155,28 +159,38 @@ Keep this directory if you want the idempotency guarantee to survive restarts.
 
 ## Telemetry
 
-Three settings. Every one is fire-and-forget: a 1-second timeout, never awaited, every failure swallowed and
+**On by default.** Every priced call sends one v2 row to the index: the outcome under the index's names, the
+seller host, a sha256 of the path, the amount, latency and validator names, and for a paid call a proof of payment
+the index checks on Base (below). Fire-and-forget: a 1-second timeout, never awaited, every failure swallowed and
 only counted in `debug.log`. Nothing is sent for free resources (no 402) or for replays of a stored intent.
 
-| `telemetry` | Sends |
+**Who can turn it off.** paidfor is free because these reports are what the index is made from. So the account
+decides, not a local flag:
+
+| You use the library | Reporting |
 | --- | --- |
-| `"off"` (default) | Nothing. |
-| `"anonymous"` | A v1 row: the outcome, amount, latency and validator names. No wallet address, no proof. |
-| `"verified"` | A v2 row: the same fields with the outcome under the index's names, plus a proof of payment the index checks on Base. |
+| With no account | On. It cannot be turned off. |
+| With a team key on the Free plan | On. It cannot be turned off. |
+| With a team key on a paid plan (Team, Platform) | On, unless the team turns it off on its [account page](https://paidfor.dev/team). Every client holding one of the team's keys follows that switch from its next payment. |
 
-v1 row:
+In team mode the server says which applies in every `/v1/team/authorize` answer (`telemetry.report`), which the
+client asks before each payment anyway: there is no extra request. When it cannot tell (an older server, an answer
+without the field, a refusal before the team was first asked), it reports.
 
-```json
-{ "v": 1, "host": "api.example.com", "path_hash": "<sha256 hex of the path>", "outcome": "ok",
-  "amount_usdc": "0.010000", "latency_ms": 412, "validator_failures": [], "client": "x402-safe-fetch/<version>" }
-```
+`telemetry: "anonymous"` and `telemetry: "off"` still type-check, but are requests the client cannot grant on its
+own: without a paid account that turned reporting off, verified rows are still sent and one line says so, once per
+process. From this release on, the v1 ("anonymous") row is no longer sent; the index still accepts it from older versions.
 
-Both payloads and every field are documented in [docs/telemetry.md](docs/telemetry.md).
+**Plainly:** this is open source. You can edit your copy, point `indexUrl` at another index, or set
+`indexUrl: false`, which sends nothing and also turns off the seller check before paying. Opting out through the
+account is a paid feature, not the only way out. It is the way that keeps the protections.
+
+Every field is documented in [docs/telemetry.md](docs/telemetry.md).
 
 ## What verified telemetry sends and why
 
-paidfor.dev measures sellers with its own wallet, which cannot cover the whole market. With
-`telemetry: "verified"`, each of your purchases becomes a data point the index can trust, because it can prove
+paidfor.dev measures sellers with its own wallet, which cannot cover the whole market. With reporting on, each of
+your purchases becomes a data point the index can trust, because it can prove
 on-chain that you actually paid: it looks up the `AuthorizationUsed(payer, nonce)` event and the matching USDC
 `Transfer` on Base. Rows that do not verify are stored but never counted.
 
@@ -213,16 +227,17 @@ This is the whole message, for a paid call that got a 500:
 - **What the payer address adds.** Every settled x402 payment is already a public USDC transfer from your
   address to the seller's pay-to address, with this nonce, on Base; the address, the amount and the seller's
   pay-to are readable by anyone. What the row adds is the link from that payment to the seller host, the path
-  hash, the outcome you observed, the validator failures and the response hash. Use `"verified"` only if you
-  are comfortable with that association; `"anonymous"` sends the outcome without it.
+  hash, the outcome you observed, the validator failures and the response hash. If you are not comfortable with
+  that association, use a team account on a paid plan and turn reporting off, or `indexUrl: false` (above).
 - **The plain path, for unknown sellers only (0.2.1).** When the index answered `unknown` before paying (it has
   never measured that seller), the row also carries `"path": "/v1/quote"`: the URL path, never the query string
   or fragment. The index keeps the host and path of a verified payment to such a seller so it can buy that
   seller itself at its next scheduled run, and lists it at paidfor.dev/candidates. For every seller the index
-  knows, only `path_hash` is sent, as before. `"anonymous"` never sends a path.
+  knows, only `path_hash` is sent, as before.
 - **Keyless ingest, https only.** `POST {indexUrl}/telemetry` needs no account and no key, and the index stores
-  no IP address or identity with the row. With `"verified"`, `safeFetch` refuses a plain-http `indexUrl`
-  (loopback excepted, for local testing), and telemetry never follows a redirect.
+  no IP address or identity with the row. A row goes only to an https `indexUrl` (loopback excepted, for local
+  testing): with a plain-http one, nothing is sent and one line says so (an explicit `telemetry: "verified"` makes
+  it throw instead), and telemetry never follows a redirect.
 - **Client header (0.2.2).** Every request to the index, the pre-pay check and the telemetry POST, carries
   `X-Paidfor-Client: x402-safe-fetch/<version>`: the package name and version, nothing else. The index uses it
   only to count calls per client.
@@ -237,12 +252,14 @@ This is the whole message, for a paid call that got a 500:
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
   `error`.
-- **Turning it off.** `telemetry: "anonymous"` sends the v1 row without any address; `telemetry: "off"` (the
-  default) sends nothing. `indexUrl: false` turns off the index lookup and all telemetry.
+- **Turning it off.** See [who can turn it off](#telemetry): a team account on a paid plan, on its account page.
+  `indexUrl: false` turns off the index lookup and all telemetry.
 
-The first time a receipts directory is used with `"verified"`, the client prints a one-line notice pointing
+The first time a receipts directory is used with reporting on, the client prints a one-line notice pointing
 here, through `logger.warn` (stderr with the default console). `telemetryNotice: false` turns it off;
-`telemetryNotice: (msg) => ...` sends it to your own function instead. Nothing else changes.
+`telemetryNotice: (msg) => ...` sends it to your own function instead. Nothing else changes. The line that
+`"anonymous"` or `"off"` was not honoured is never silenced: `telemetryNotice: false` does not hide it, and a
+function receives it.
 
 ## With a team account
 

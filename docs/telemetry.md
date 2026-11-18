@@ -1,14 +1,17 @@
 # Telemetry
 
-Telemetry is **off by default**. `telemetry: "anonymous"` sends a v1 row (below). `telemetry: "verified"` sends a
-v2 row: the v1 fields plus a proof of payment (see "Version 2"). The report-only adapters send the tx_only row (see
-"tx_only (report-only)").
+Telemetry is **on by default** (since the release after 0.6.0; issue
+[sarmadahsan/paidfor-index#41](https://github.com/sarmadahsan/paidfor-index/issues/41)): `safeFetch` sends a v2 row,
+the v1 fields plus a proof of payment (see "Version 2"). Only a team account on a paid plan can turn it off, on its
+account page; the server says so in each `/v1/team/authorize` answer (`telemetry.report: "off"`). `telemetry:
+"anonymous"` and `"off"` are not honoured on their own, and `safeFetch` no longer sends the v1 row (below), which the
+index still accepts from older versions. The report-only adapters send the tx_only row (see "tx_only (report-only)").
 
 When it is on, each call that received an HTTP 402 sends one JSON object to `POST {indexUrl}/telemetry`
 (by default `https://paidfor.dev/v1/telemetry`). That object is the whole message. Nothing else is sent.
 No account and no key are needed to send it.
 
-## The exact payload (v1, `"anonymous"`)
+## The exact payload (v1, `"anonymous"` up to 0.6.0)
 
 ```json
 {
@@ -58,9 +61,11 @@ in either version: nothing was paid, and the row would otherwise read as a failu
 ## The promise
 
 This client sends paidfor.dev the outcome of a purchase and nothing that identifies the buyer, the wallet,
-or what was bought beyond the seller host and a path hash. The exceptions are opt-in and listed here: v2
-(`"verified"`) adds the proof of payment, and from 0.2.1 the plain path for a seller the index has never
-measured. If a future version needs to send more, it will list the new fields here and stay opt-in.
+or what was bought beyond the seller host and a path hash. The exceptions are listed here: v2 (`"verified"`) adds
+the proof of payment, and from 0.2.1 the plain path for a seller the index has never measured. Until 0.6.0 this
+promise also said they would stay opt-in; that changed when reporting became the default (above), and the CHANGELOG
+says so at the top. If a future version needs to send more, it will list the new fields here and in the CHANGELOG
+before it sends them.
 
 ## Version 2 (`"verified"`)
 
@@ -133,7 +138,7 @@ has no `Content-Type` header, is `ok`, not `non_delivery`. Its v2 row adds one f
 Codes only: the declared and received types stay in the receipt (`receipt.warnings`), never in the row. A row without
 warnings has no `warnings` field, exactly as before. The index counts these rows as delivered (in the denominator, not
 in the failures) and shows them on the seller's page as their own observation. An index that predates the field answers 400 to a row that carries it (the client sends it to whatever `indexUrl` is set), so this release is published only after paidfor.dev accepts the field. v1
-(`"anonymous"`) rows carry no warnings: the call is simply `ok`.
+rows (`"anonymous"` up to 0.6.0; `safeFetch` no longer sends them) carry no warnings: the call is simply `ok`.
 
 ### `path` (0.2.1): only for sellers the index has never measured
 
@@ -149,7 +154,7 @@ the URL path exactly as it was hashed for `path_hash` (no query string, no fragm
 the host and path of a verified payment to such a seller on its candidate list (`GET {indexUrl}/candidates`) so
 it can buy the seller itself at its next scheduled run, and drops the path from the stored row once the payment
 is checked. These are public API endpoints; the index already saw the same origin and path in the pre-pay
-lookup. `"anonymous"` (v1) never sends it.
+lookup. A v1 row (`"anonymous"` up to 0.6.0) never carried it.
 
 `validator_failed` stays a v1-only outcome. The payer address, amount and pay-to are public on-chain for every
 settled payment; the v2 row adds the link from that payment to the seller host, path hash, outcome, validator

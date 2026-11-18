@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+> **Upgrading turns reporting on.** Until 0.6.0 `telemetry` was `"off"` by default and a from-code payment told the
+> index nothing. From this release, every priced call reports its outcome to the index with its proof of payment
+> (the v2 row in docs/telemetry.md: payer, nonce, pay-to, tx hash; never bodies, request parameters, IP or identity),
+> with no options. If you used the default, you start reporting when you upgrade. Issue
+> [sarmadahsan/paidfor-index#41](https://github.com/sarmadahsan/paidfor-index/issues/41).
+
+- **Reporting is on by default, and the account decides who can turn it off.** paidfor is free because these
+  reports are what the index is made from. With no account, or a team key on the Free plan, reporting cannot be
+  turned off. A team on a paid plan turns it off on its account page, and every client holding one of its keys follows
+  that from its next payment: the server says so in every `/v1/team/authorize` answer (`telemetry.report`), which
+  the client asks before each payment anyway. When it cannot tell (an older server, no field, a local refusal before
+  the team was first asked), it reports.
+- **`telemetry: "anonymous"` and `"off"` are no longer honoured on their own.** They still type-check. Without a
+  paid account that turned reporting off, verified rows are still sent and one line says so, once per process, with
+  the plans page; `telemetryNotice: false` does not hide that line. Nothing throws. `safeFetch` no longer sends the v1
+  row; the index still accepts it from older versions. A paid team's account switch wins over `telemetry: "verified"`.
+- **A plain-http `indexUrl`** (not loopback) gets no rows by default, and one line says so; an explicit
+  `telemetry: "verified"` still throws, as before.
+- **The one-time notice** now says reporting is on, why, and who can turn it off. It is shown once per receipts
+  directory, as before, also with no options.
+- Unchanged: `indexUrl: false` sends nothing (and checks no seller); the report-only adapters
+  (`withPaidforReporting`, `withPaidforReportingAxios`, `report()`) exist only to report and have no switch; refusals
+  carry no proof and are counted by reason. This is open source: opting out through the account is a paid feature, not
+  the only way out.
+- `TeamDecision` carries `telemetry?: "verified" | "off"`, and `TeamClient.telemetryReport()` returns what the last
+  authorize answer said.
 - **Usable content in another format than declared is a warning, not a failed delivery** (paidfor-index issue 40).
   When the seller declares one type and answers with usable content in another (`application/json` declared, the
   article sent as `text/markdown`; JSON labelled `text/plain`), or with no `Content-Type` header, the receipt's
