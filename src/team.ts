@@ -144,15 +144,28 @@ const MAX_RETRY_AFTER = 253_402_300_799;
 /** `retry_after` is absolute Unix seconds (docs/team-api.md); a value that cannot be one is dropped, the decline kept. */
 const retryAfter = (v: unknown): number | undefined => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 && v <= MAX_RETRY_AFTER ? v : undefined);
 
+/** One line of server text: control characters become spaces, so a warning cannot break or forge a log line. */
+const oneLine = (s: string, max: number) => s.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, max);
+
+/**
+ * The answer's `warnings`, read the way @paidfor/mcp reads them (its readWarnings), so a receipt carries what the MCP
+ * shows for the same answer: any entry with a message counts, and one with no code gets the code "warning". Never
+ * turns a decision into "failed".
+ */
+function readWarnings(v: unknown): TeamWarning[] {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((w): TeamWarning[] => {
+    if (!w || typeof w !== "object") return [];
+    const o = w as Record<string, unknown>;
+    const message = str(o.message) ? oneLine(o.message, 500) : "";
+    if (!message) return [];
+    const code = str(o.code) ? oneLine(o.code, 100) : "";
+    return [{ code: code || "warning", message, ...(str(o.upgrade_url) ? { upgrade_url: o.upgrade_url } : {}) }];
+  });
+}
+
 function extras(d: Record<string, unknown>): TeamDecisionExtras {
-  const warnings = Array.isArray(d.warnings)
-    ? d.warnings.flatMap((w): TeamWarning[] => {
-        if (!w || typeof w !== "object") return [];
-        const o = w as Record<string, unknown>;
-        if (!str(o.code) || !str(o.message)) return [];
-        return [{ code: o.code.slice(0, 100), message: o.message.slice(0, 500), ...(str(o.upgrade_url) ? { upgrade_url: o.upgrade_url } : {}) }];
-      })
-    : [];
+  const warnings = readWarnings(d.warnings);
   const usage = d.usage && typeof d.usage === "object" && !Array.isArray(d.usage) ? (d.usage as Record<string, unknown>) : undefined;
   const t = d.telemetry && typeof d.telemetry === "object" ? (d.telemetry as Record<string, unknown>).report : undefined;
   const telemetry = t === "off" ? "off" : t === "verified" ? "verified" : undefined;

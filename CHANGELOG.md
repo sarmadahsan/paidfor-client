@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.1
+
+Fixes from the production re-test of 2026-11-18 (paidfor-index `docs/e2e-issues.md`, issues 45 and 46).
+
+- **The "caution" line is said only when it is true** (issue 45). `paying <host>, which paidfor.dev rates "caution"`
+  went to `logger.warn` as soon as the verdict was read, before the price check, the per-call cap and, in team mode,
+  the account's answer. When one of them then refused (for example the account declining a caution seller that is
+  not on the wallet's trusted list), the line spoke of a payment that was never made. It is now said once every check
+  has passed and the approval is in, just before signing; a refused payment logs nothing about it.
+- **Team warnings are read the way `@paidfor/mcp` reads them** (issue 46). `receipt.team.warnings` already carried
+  each warning with a `code` and a `message`; an entry with a message and no code is now kept too (code `"warning"`),
+  and control characters in a warning become spaces. Tests now pin the server's own words and shape (the Free plan's
+  `extra_wallet` warning, with `usage`) on an approval, a decline and a payment waiting for a person, and on
+  `TeamRefusedError`'s receipt. An answer without `warnings` still gives `[]`: paidfor's server leaves `warnings` and
+  `usage` out of an answer whenever its usage meter has not finished within 200 ms of the decision, so the same
+  account and wallet can get them on one payment and not on the next.
+- Telemetry `client` is `x402-safe-fetch/0.7.1`.
+
 ## 0.7.0
 
 > **Upgrading turns reporting on.** Through 0.6.0 `telemetry` was `"off"` by default and a from-code payment told the
