@@ -363,6 +363,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const noticeOpt = options.telemetryNotice ?? true;
   /** The reporting notice waits for the first payment about to be signed (issue 63); once per client, and per directory. */
   let noticeStarted = false;
+  /** The notice in flight, awaited before the first payment it belongs to is signed. */
+  let noticeShown: Promise<void> | undefined;
   if (indexUrl !== undefined && !secureIndex && !insecureNoticeShown) {
     insecureNoticeShown = true;
     warn(`nothing is reported to ${indexUrl}: outcome reports carry the payer and nonce and go only to an https index (or a loopback one).`);
@@ -638,6 +640,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     let failure: { code: SafeFetchErrorCode; message: string } | undefined;
     // Set when the wallet held less than the quote: what it held and what was needed (atomic).
     let short: { have: bigint; need: bigint } | undefined;
+    // Set when the caller aborted the request before the payment was signed: nothing is signed or reported.
+    let aborted = false;
     let signingStarted = false;
     let signedRecorded = false;
     let sent = false;
@@ -800,7 +804,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           code: "insufficient_funds",
           message:
             `refused to pay ${usd} for ${req.url}: the wallet ${signer.address} holds ${atomicToUsdc(have)} USDC on ${NETWORK_NAME[network]} ` +
-            `and this payment needs ${atomicToUsdc(amount)} USDC. Nothing was signed. Fund the wallet, then call again (the same intentId is safe).`,
+            `and this payment needs ${atomicToUsdc(amount)} USDC. Nothing was signed. Fund the wallet, then call again with the same intentId.`,
         };
         return { abort: true, reason: failure.message };
       }
@@ -852,14 +856,22 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         failure = { code: "sdk", message: `could not record intent before signing: ${errMsg(e)}` };
         return { abort: true, reason: failure.message };
       }
-      if (i.available && i.verdict === "caution") {
-        warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
-      }
       // The first payment about to be signed with reporting on says what reporting sends; a run that pays nothing
       // (a refusal, an empty wallet, a free resource) says nothing about it (issue 63).
       if (!noticeStarted && noticeOpt !== false && reportsNow(r)) {
         noticeStarted = true;
-        void verifiedNotice();
+        noticeShown = verifiedNotice().catch(() => undefined);
+      }
+      if (noticeShown) await noticeShown;
+      // The checks above wait on the index, the balance and the approval; a caller that gave up meanwhile gets nothing
+      // signed for it.
+      if (req.signal?.aborted) {
+        aborted = true;
+        failure = { code: "network", message: `the request for ${req.url} was aborted before the payment was signed; nothing was signed` };
+        return { abort: true, reason: failure.message };
+      }
+      if (i.available && i.verdict === "caution") {
+        warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
       }
       return undefined;
     });
@@ -990,7 +1002,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       attachProof(r, undefined, {});
       await lease.update({ phase: "failed_unpaid" }).catch(() => undefined);
       await persistReceipt(r);
-      if (quoteResult) emitTelemetry(r);
+      // A caller's abort says nothing about the seller.
+      if (quoteResult && !aborted) emitTelemetry(r);
       if (code === "insufficient_funds" && short) {
         throw new InsufficientFundsError(`x402-safe-fetch: ${message}`, signer.address, atomicToUsdc(short.have), atomicToUsdc(short.need), r);
       }

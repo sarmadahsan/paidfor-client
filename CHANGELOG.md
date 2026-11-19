@@ -15,18 +15,21 @@ Fixes from the launch-gate run of 2026-11-19 (paidfor-index `docs/e2e-issues.md`
   before. New options `rpcUrl` (an endpoint of your own, or `false` to skip the read) and `balanceTimeoutMs`.
 - **The reporting notice waits for a payment** (issue 63). "reporting is on" was printed when the client was created,
   so a run whose only call was declined (or refused, or free) printed it though nothing was paid. It is now printed
-  when the first payment is about to be signed with reporting on, still once per receipts directory, and not at all for
+  when the first payment is about to be signed with reporting on (and before it is signed), still once per receipts directory, and not at all for
   a team whose account turned reporting off.
 - **No promise of an opt-out that cannot be bought** (issue 56). The README, `docs/telemetry.md`, the notice and the
   "not honoured" line said a paid plan could turn reporting off. Paid plans are not sold yet: they now say that on the
   Free plan reporting cannot be turned off, and that the Team plan with that switch is coming soon.
 - **A quickstart that runs when pasted** (issue 58). The install line names every package the example imports, pinned
   (`@paidfor/x402-safe-fetch@0.7.2 viem`; `viem` is not a dependency or peer dependency, so pnpm would not resolve
-  it), the example is a complete `pay.mjs`, and the MCP server is one link to https://paidfor.dev/install instead of
+  it), the example is a complete `pay.mjs` that prints its intent id and takes it back for a retry, and the MCP server is one link to https://paidfor.dev/install instead of
   `@paidfor/mcp@latest`.
 - **Intent ids with a random part** (issue 59). The README and `examples/conway-topup.ts` built the id from the task and
   the date, the pattern that makes a second real purchase replay the first. Both now mint it with `randomUUID()`, and
   the README says when to reuse an id (retrying the same purchase) and when not to.
+- **A request aborted before signing signs nothing.** The checks before signing wait on the index, the balance and an
+  approval; a caller that aborts meanwhile now gets a `network` error with nothing signed, sent or reported, instead
+  of a signed payment whose paid request is then cancelled.
 - Telemetry `client` is `x402-safe-fetch/0.7.2`.
 
 ## 0.7.1

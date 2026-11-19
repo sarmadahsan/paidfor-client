@@ -45,8 +45,10 @@ const fetchWithPay = safeFetch(account, {
   // Reporting to the index is on by default and, on the Free plan, cannot be turned off (see Telemetry).
 });
 
-// One id per purchase, minted once with a random part.
-const intentId = `report:${randomUUID()}`;
+// One id per purchase, minted once with a random part. To retry the same purchase after an error or a timeout,
+// pass the id it printed: node pay.mjs <x402 URL> <intent id>
+const intentId = process.argv[3] ?? `report:${randomUUID()}`;
+console.log("intent", intentId);
 const res = await fetchWithPay(process.argv[2], {}, { intentId });
 console.log(res.status, res.receipt.outcome, res.receipt.tx_hash);
 ```
@@ -143,7 +145,10 @@ of `balanceOf` to `rpcUrl`: https://mainnet.base.org on Base, https://sepolia.ba
 request carries the wallet address and the USDC contract address, nothing else. When the balance is below the quoted
 amount, nothing is signed or sent and `InsufficientFundsError` (code `insufficient_funds`) is thrown; it carries
 `address`, `balanceUsdc` and `amountUsdc`, and its message names all three. No row is sent to the index (a wallet that
-cannot pay says nothing about the seller). Fund the wallet and call again; the same `intentId` is safe.
+cannot pay says nothing about the seller). Fund the wallet and call again with the same `intentId`: this call signed
+nothing. If that intent had an earlier payment the seller rejected, the rules in
+[When the seller rejects the payment](#when-the-seller-rejects-the-payment) still apply to the retry (in team mode, a
+new nonce after the old deadline needs the `authorizationState` check first).
 
 When the read fails (an RPC error, an answer it cannot read, or no answer within `balanceTimeoutMs`, default 4000), the
 payment is not blocked on it: one line says so and the call goes ahead as before 0.7.2. `rpcUrl` takes your own

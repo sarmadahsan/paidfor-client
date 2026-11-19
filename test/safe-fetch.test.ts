@@ -844,6 +844,16 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(await readFile(join(dir, ".verified-telemetry-notice"), "utf8")).toMatch(/^\d{4}-/);
   });
 
+  it("the notice reaches a telemetryNotice function before the first payment is sent", async () => {
+    const order: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (new Headers(init?.headers).has("payment-signature")) order.push("paid request");
+      return globalThis.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    await client({ fetch: fetchImpl, telemetryNotice: () => order.push("notice") })(`${mock.base}/data`);
+    expect(order).toEqual(["notice", "paid request"]);
+  });
+
   it("telemetryNotice: false never shows the notice; a function receives it instead of the logger", async () => {
     await client({ telemetry: "verified", telemetryNotice: false })(`${mock.base}/data`);
     await settle();
@@ -940,6 +950,22 @@ describe("safeFetch: the wallet's balance is read before signing (issue 57)", ()
     expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "ok", proof: { payer: account.address.toLowerCase() } });
   });
 
+  it("after a rejected payment, an empty-wallet refusal keeps the rejected nonce: the funded retry signs that same nonce", async () => {
+    mock.st.mode = "reject_402";
+    const f = client();
+    const first = await f(`${mock.base}/data`, {}, { intentId: "rej-empty" });
+    expect(first.receipt.outcome).toBe("payment_rejected");
+    expect(mock.st.nonces).toHaveLength(1);
+    mock.st.balance = "0";
+    await expect(f(`${mock.base}/data`, {}, { intentId: "rej-empty" })).rejects.toMatchObject({ code: "insufficient_funds" });
+    expect(mock.st.nonces).toHaveLength(1);
+    mock.st.mode = "ok";
+    mock.st.balance = "1000000";
+    const res = await f(`${mock.base}/data`, {}, { intentId: "rej-empty" });
+    expect(res.receipt).toMatchObject({ outcome: "ok", paid: true });
+    expect(mock.st.nonces).toEqual([mock.st.nonces[0], mock.st.nonces[0]]);
+  });
+
   it.each([
     ["an HTTP 500", { kind: "status", status: 500 }],
     ["a JSON-RPC error", { kind: "rpc_error" }],
@@ -962,6 +988,20 @@ describe("safeFetch: the wallet's balance is read before signing (issue 57)", ()
     expect(res.receipt.paid).toBe(true);
     expect(Date.now() - t0).toBeLessThan(3000);
     expect(warnings.filter((w) => w.includes("balance could not be read"))).toHaveLength(1);
+  });
+
+  it("a caller that aborts while the balance is read gets nothing signed, sent or reported", async () => {
+    mock.st.balance = "hang";
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+    const err = (await client({ balanceTimeoutMs: 400 })(`${mock.base}/data`, { signal: ac.signal }).catch((e: unknown) => e)) as SafeFetchError;
+    expect(err).toBeInstanceOf(SafeFetchError);
+    expect(err.message).toMatch(/aborted before the payment was signed/);
+    expect(err.receipt).toMatchObject({ paid: false, nonce: null });
+    expect(mock.st.paidCount).toBe(0);
+    expect(mock.st.nonces).toEqual([]);
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
   });
 
   it("rpcUrl: false skips the read", async () => {
