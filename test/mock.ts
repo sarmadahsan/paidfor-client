@@ -32,6 +32,10 @@ export interface MockState {
   indexCalls: string[];
   telemetryStatus: number | "hang";
   telemetry: unknown[];
+  /** The wallet balance the mock RPC answers balanceOf with (atomic USDC), or how it fails. */
+  balance: string | { kind: "status"; status: number } | { kind: "raw"; body: string } | { kind: "rpc_error" } | "hang";
+  /** Every JSON-RPC request the mock RPC received. */
+  rpcCalls: { method: string; params: unknown[] }[];
 }
 
 export const payTo = privateKeyToAccount(generatePrivateKey()).address;
@@ -48,6 +52,8 @@ export function freshState(): MockState {
     indexCalls: [],
     telemetryStatus: 404,
     telemetry: [],
+    balance: "1000000000",
+    rpcCalls: [],
   };
 }
 
@@ -118,6 +124,22 @@ async function handler(st: MockState, req: IncomingMessage, res: ServerResponse)
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(ix.body));
+    return;
+  }
+  if (path === "/rpc") {
+    const call = JSON.parse(await readBody(req)) as { id: number; method: string; params: unknown[] };
+    st.rpcCalls.push({ method: call.method, params: call.params });
+    const b = st.balance;
+    if (b === "hang") return;
+    if (typeof b === "object" && b.kind === "status") {
+      res.writeHead(b.status);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    if (typeof b === "object" && b.kind === "raw") res.end(b.body);
+    else if (typeof b === "object") res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, error: { code: -32000, message: "header not found" } }));
+    else res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result: `0x${BigInt(b).toString(16).padStart(64, "0")}` }));
     return;
   }
   if (path === "/v1/telemetry") {

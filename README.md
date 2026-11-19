@@ -6,34 +6,59 @@ pays twice for the same intent, and checks what it bought. No account, no key, n
 install it, not to read the index, and not to contribute to it.
 
 **It reports each purchase outcome to the index by default**, with its proof of payment (see
-[Telemetry](#telemetry)). That is the deal that keeps paidfor free: the index is made from these reports. Only a team
-account on a paid plan can turn reporting off.
+[Telemetry](#telemetry)). That is the deal that keeps paidfor free: the index is made from these reports. On the Free
+plan, with or without an account, reporting is on and cannot be turned off. A Team plan with a switch for it is
+[coming soon](https://paidfor.dev/pricing); nothing that turns it off is sold today.
 
-This is the client-side half of the x402 seller index at [paidfor.dev](https://paidfor.dev).
+This is the client-side half of the x402 seller index at [paidfor.dev](https://paidfor.dev). Paying from an agent
+(Claude, Cursor, Codex) rather than from your own code? Set up the paidfor MCP server from https://paidfor.dev/install.
+
+## Quickstart
+
+Install the library and `viem`, which the example uses to load the wallet. `viem` is not a dependency or a peer
+dependency of this package (you bring the wallet), so it has to be installed next to it; with pnpm, importing it
+without that fails with `ERR_MODULE_NOT_FOUND`.
 
 ```bash
-npm install @paidfor/x402-safe-fetch
+pnpm add @paidfor/x402-safe-fetch@0.7.2 viem
+# or: npm install @paidfor/x402-safe-fetch@0.7.2 viem
 ```
 
-```ts
+Save this as `pay.mjs` and run `node pay.mjs <x402 URL>` (Node 20.3 or later) with `PRIVATE_KEY` set in the
+environment to the 0x-prefixed key of a wallet holding USDC on Base. Load it from a secrets manager or an untracked
+file, not from your repository or your shell history.
+
+```js
+import { randomUUID } from "node:crypto";
+import { privateKeyToAccount } from "viem/accounts";
 import { safeFetch } from "@paidfor/x402-safe-fetch";
 
-const fetchWithPay = safeFetch(walletClient, {
-  maxPerCallUsd: 0.50,
+const account = privateKeyToAccount(process.env.PRIVATE_KEY);
+
+const fetchWithPay = safeFetch(account, {
+  maxPerCallUsd: 0.5,
   maxOverListedRatio: 1.1,     // refuse quotes more than 10% above the listed/known price
   refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed, and logged when it is paid
   indexUrl: "https://paidfor.dev/v1",
   validators: ["http_status", "non_empty", "content_type", "not_truncated"],
-  // Reporting to the index is on by default; only a paid team account turns it off (see Telemetry).
   receiptsDir: "./.x402-receipts",
+  // Reporting to the index is on by default and, on the Free plan, cannot be turned off (see Telemetry).
 });
 
-const res = await fetchWithPay(url, init, { intentId: "topup:acct_42:2026-10" });
+// One id per purchase, minted once with a random part.
+const intentId = `report:${randomUUID()}`;
+const res = await fetchWithPay(process.argv[2], {}, { intentId });
 console.log(res.status, res.receipt.outcome, res.receipt.tx_hash);
 ```
 
-`walletClient` is a viem account (`privateKeyToAccount(...)`) or a viem `WalletClient` with an account attached.
-Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:84532"` for Base Sepolia).
+Reuse an `intentId` only to retry the same purchase after an error or a timeout (it is what stops a second payment);
+every new purchase needs a new one. Never build the id from the task and the date alone: a second real purchase on
+the same day would get the first one's stored result back instead of being paid for.
+
+`safeFetch` also takes a viem `WalletClient` with an account attached. Payments are exact-scheme USDC on Base mainnet
+by default (`network: "eip155:84532"` for Base Sepolia). Before signing, it reads the wallet's USDC balance from a
+public Base RPC, and an empty wallet stops there with an `InsufficientFundsError` (see
+[An empty wallet](#an-empty-wallet)).
 
 ## What happens on every call
 
@@ -43,7 +68,9 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
    price this client paid for the same resource. It refuses with a `PaymentRefusedError` when the seller verdict
    is in `refuseVerdicts`, the quote exceeds `maxOverListedRatio` times the reference, or the amount exceeds
    `maxPerCallUsd`. The error says why and links the seller page. The index is advisory: if it is down, slow or
-   answers `unknown`, the call proceeds on the local checks and the receipt says `index: "unavailable"`.
+   answers `unknown`, the call proceeds on the local checks and the receipt says `index: "unavailable"`. Last, it
+   reads the wallet's balance of the quoted asset and throws `InsufficientFundsError` when it is below the quote
+   (0.7.2, [below](#an-empty-wallet)).
 2. **Idempotency.** Every call has an `intentId`, yours or a generated one. The request hash is written to the
    receipts directory before signing, and the signed nonce is written before the payment is sent. A retry with
    the same `intentId` and request returns the stored response and never signs again. A retry with the same
@@ -65,6 +92,7 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 | A quote more than `maxOverListedRatio` above the index listed price | An overpriced first purchase from a resource with no listed price and no local history |
 | A quote more than `maxOverListedRatio` above the last price this client paid | Slow price creep, if you keep accepting each step |
 | Any single payment above `maxPerCallUsd` | Total spend across many calls: there is no daily or per-seller budget |
+| Signing for a wallet that holds less USDC than the quote (0.7.2) | A wallet emptied between the balance read and the payment, or any payment when the RPC cannot be read |
 | Paying twice for the same `intentId`, across restarts and concurrent processes | Duplicates when each retry uses a new `intentId` (pass a stable one) |
 | Re-signing after a timeout or crash once a payment was signed | Recovering that money: the call fails with the nonce so you can check the chain |
 | Non-USDC assets, other networks, non-`exact` schemes, and redirects of the paid request | A seller that settles and then serves wrong or stale content that still passes the four validators |
@@ -78,7 +106,8 @@ Payments are exact-scheme USDC on Base mainnet by default (`network: "eip155:845
 | --- | --- | --- | --- |
 | `ok` | Paid, and every validator passed. A usable answer in another format than the seller declared is `ok` with a warning in `warnings` (0.7.0). | `true` | Returned |
 | `validator_failed` | Paid, and a validator failed (a non-2xx answer, an empty or truncated body, an HTML or error page in place of the declared type, JSON that does not parse). | `true` | Returned |
-| `payment_rejected` (0.6.0) | The signed payment was sent and the seller answered HTTP 402 again, with no settlement header or one saying it failed: usually a wallet without enough USDC. Nothing settled. | `false` | Returned (status 402) |
+| `payment_rejected` (0.6.0) | The signed payment was sent and the seller answered HTTP 402 again, with no settlement header or one saying it failed: usually a wallet without enough USDC whose balance could not be read before signing. Nothing settled. | `false` | Returned (status 402) |
+| `insufficient_funds` (0.7.2) | The wallet holds less of the quoted asset than the quote. Nothing was signed or sent. | `false` | Thrown (`InsufficientFundsError`) |
 | `paid_no_response` | Signed and maybe sent, and no response came back. | `true` if sent | Thrown |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | Refused before signing. | `false` | Thrown |
 | `no_acceptable_quote` | No exact USDC quote on the configured network. | `false` | Thrown |
@@ -105,6 +134,20 @@ JSON mislabelled, so a warning), an undeclared `application/problem+json`
 document, or a body that should be JSON and does not parse. A different `+json` type or parameters (`; charset=utf-8`)
 are the same format and raise no warning. A seller that declares no type is judged against `application/json`.
 Empty, truncated and non-2xx answers fail as before.
+
+### An empty wallet
+
+Since 0.7.2, after the seller, price and cap checks and before anything is signed (and before a team is asked), the
+client reads the wallet's balance of the asset the quote asks for (USDC on the configured network) with one `eth_call`
+of `balanceOf` to `rpcUrl`: https://mainnet.base.org on Base, https://sepolia.base.org on Base Sepolia by default. That
+request carries the wallet address and the USDC contract address, nothing else. When the balance is below the quoted
+amount, nothing is signed or sent and `InsufficientFundsError` (code `insufficient_funds`) is thrown; it carries
+`address`, `balanceUsdc` and `amountUsdc`, and its message names all three. No row is sent to the index (a wallet that
+cannot pay says nothing about the seller). Fund the wallet and call again; the same `intentId` is safe.
+
+When the read fails (an RPC error, an answer it cannot read, or no answer within `balanceTimeoutMs`, default 4000), the
+payment is not blocked on it: one line says so and the call goes ahead as before 0.7.2. `rpcUrl` takes your own
+endpoint; `rpcUrl: false` skips the read.
 
 ### When the seller rejects the payment
 
@@ -171,19 +214,19 @@ decides, not a local flag:
 | --- | --- |
 | With no account | On. It cannot be turned off. |
 | With a team key on the Free plan | On. It cannot be turned off. |
-| With a team key on a paid plan (Team, Platform) | On, unless the team turns it off on its [account page](https://paidfor.dev/team). Every client holding one of the team's keys follows that switch from its next payment. |
 
-In team mode the server says which applies in every `/v1/team/authorize` answer (`telemetry.report`), which the
-client asks before each payment anyway: there is no extra request. When it cannot tell (an older server, an answer
-without the field, a refusal before the team was first asked), it reports.
+The Team plan, [coming soon](https://paidfor.dev/pricing), is to add a switch for it on the account page. It cannot
+be bought yet. The client already follows the account's answer: in team mode the server says what applies in every
+`/v1/team/authorize` answer (`telemetry.report`), which the client asks before each payment anyway, so there is no
+extra request. When it cannot tell (an older server, an answer without the field, a refusal before the team was first
+asked), it reports.
 
 `telemetry: "anonymous"` and `telemetry: "off"` still type-check, but are requests the client cannot grant on its
-own: without a paid account that turned reporting off, verified rows are still sent and one line says so, once per
-process. From this release on, the v1 ("anonymous") row is no longer sent; the index still accepts it from older versions.
+own: on the Free plan, verified rows are still sent and one line says so, once per process. From this release on, the v1 ("anonymous") row is no longer sent; the index still accepts it from older versions.
 
 **Plainly:** this is open source. You can edit your copy, point `indexUrl` at another index, or set
 `indexUrl: false`, which sends nothing and also turns off the seller check before paying. Opting out through the
-account is a paid feature, not the only way out. It is the way that keeps the protections.
+account is to be a Team plan feature (coming soon), not the only way out. It is the way that keeps the protections.
 
 Every field is documented in [docs/telemetry.md](docs/telemetry.md).
 
@@ -228,7 +271,7 @@ This is the whole message, for a paid call that got a 500:
   address to the seller's pay-to address, with this nonce, on Base; the address, the amount and the seller's
   pay-to are readable by anyone. What the row adds is the link from that payment to the seller host, the path
   hash, the outcome you observed, the validator failures and the response hash. If you are not comfortable with
-  that association, use a team account on a paid plan and turn reporting off, or `indexUrl: false` (above).
+  that association, `indexUrl: false` (above) sends nothing; on the Free plan there is no other switch.
 - **The plain path, for unknown sellers only (0.2.1).** When the index answered `unknown` before paying (it has
   never measured that seller), the row also carries `"path": "/v1/quote"`: the URL path, never the query string
   or fragment. The index keeps the host and path of a verified payment to such a seller so it can buy that
@@ -252,11 +295,12 @@ This is the whole message, for a paid call that got a 500:
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
   `error`.
-- **Turning it off.** See [who can turn it off](#telemetry): a team account on a paid plan, on its account page.
-  `indexUrl: false` turns off the index lookup and all telemetry.
+- **Turning it off.** See [who can turn it off](#telemetry): not on the Free plan; the Team plan's switch is coming
+  soon. `indexUrl: false` turns off the index lookup and all telemetry.
 
-The first time a receipts directory is used with reporting on, the client prints a one-line notice pointing
-here, through `logger.warn` (stderr with the default console). `telemetryNotice: false` turns it off;
+The first time a payment is about to be signed with reporting on, in a receipts directory that has not shown it
+before, the client prints a one-line notice pointing here (0.7.2: not before; a run that pays nothing, such as a
+refusal, an empty wallet or a free resource, prints nothing about reporting), through `logger.warn` (stderr with the default console). `telemetryNotice: false` turns it off;
 `telemetryNotice: (msg) => ...` sends it to your own function instead. Nothing else changes. The line that
 `"anonymous"` or `"off"` was not honoured is never silenced: `telemetryNotice: false` does not hide it, and a
 function receives it.
@@ -298,8 +342,8 @@ What you get:
   `team: { key, project: "research-q4" }`. A tag is 1 to 64 letters, digits, spaces or `. _ -`; anything else throws
   when `safeFetch` is called.
 
-The wallet must be registered to the team: on [paidfor.dev/team](https://paidfor.dev/team), or with
-`npx -y @paidfor/mcp@latest init --wallet --link` (add `--key-file <path>` for a key file of your own). The key goes
+The wallet must be registered to the team: on [paidfor.dev/team](https://paidfor.dev/team), or from the setup on
+[paidfor.dev/install](https://paidfor.dev/install). The key goes
 only to the team origin, never to a seller, and is never logged. `team` also takes `origin` (https only, or
 http on localhost), `authorizeTimeoutMs` (default 10000), `reportTimeoutMs` (default 5000) and `project`.
 
@@ -363,6 +407,7 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |
 | `SafeFetchError` | `paid_no_response` | Signed and possibly settled; `receipt.nonce` identifies it |
 | none: returned with status 402 | `receipt.outcome` `payment_rejected` | No; the authorization stays valid until `receipt.valid_before` (see "When the seller rejects the payment") |
+| `InsufficientFundsError` (0.7.2) | `insufficient_funds`: the wallet holds less than the quote; `address`, `balanceUsdc`, `amountUsdc` | No, nothing signed |
 | `SafeFetchError` | `no_acceptable_quote`, `intent_in_flight`, `network`, `sdk` | No |
 
 ## Example

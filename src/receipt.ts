@@ -21,6 +21,7 @@ export type Outcome =
   | "no_payment_required"
   | "paid_no_response"
   | "payment_rejected"
+  | "insufficient_funds"
   | "replayed"
   | "error";
 

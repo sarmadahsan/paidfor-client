@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type AuthorizeRequest, type SafeFetchOptions } from "../src/index.js";
+import { InsufficientFundsError, IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, safeFetch, type AuthorizeRequest, type SafeFetchOptions } from "../src/index.js";
 import { resetOnceNotices } from "../src/safe-fetch.js";
 import { decodeHeaderJson } from "../src/x402/types.js";
 import { NETWORK, TX, USDC_SEPOLIA, fixture, payTo, startMock, type Mock } from "./mock.js";
@@ -40,6 +40,8 @@ function client(o: Partial<SafeFetchOptions> = {}) {
     network: NETWORK,
     // Reporting is on by default; the one-time notice is tested on its own below.
     telemetryNotice: false,
+    // The wallet balance is read from the mock RPC; it answers a large balance unless a test says otherwise.
+    rpcUrl: `${mock.base}/rpc`,
     logger: { warn: (m) => warnings.push(m) },
     ...o,
   });
@@ -584,7 +586,7 @@ describe("safeFetch: telemetry", () => {
     expect(mock.st.telemetry).toHaveLength(1);
     const p = mock.st.telemetry[0] as Record<string, unknown>;
     expect(Object.keys(p).sort()).toEqual(["amount_usdc", "client", "host", "latency_ms", "outcome", "path_hash", "proof", "v", "validator_failures"]);
-    expect(p).toMatchObject({ v: 2, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.7.1", proof: { payer: account.address.toLowerCase() } });
+    expect(p).toMatchObject({ v: 2, host: "127.0.0.1", outcome: "ok", amount_usdc: "0.010000", validator_failures: [], client: "x402-safe-fetch/0.7.2", proof: { payer: account.address.toLowerCase() } });
     expect(p.path_hash).toMatch(/^[0-9a-f]{64}$/);
     const raw = JSON.stringify(p);
     for (const leak of ["secret", "qzxw", "tel-1"]) expect(raw).not.toContain(leak);
@@ -610,7 +612,7 @@ describe("safeFetch: telemetry", () => {
     for (const row of mock.st.telemetry) expect(row).toMatchObject({ v: 2, outcome: "ok", proof: { payer: account.address.toLowerCase() } });
     const told = warnings.filter((w) => w.includes("is not honoured"));
     expect(told).toHaveLength(1);
-    expect(told[0]).toBe(`x402-safe-fetch: telemetry: "${asked}" is not honoured: purchase outcomes are reported to the index with their proof of payment, because that is what keeps paidfor free. Only a team account on a paid plan can turn reporting off, on its account page (https://paidfor.dev/team); plans: https://paidfor.dev/pricing. Shown once.`);
+    expect(told[0]).toBe(`x402-safe-fetch: telemetry: "${asked}" is not honoured: purchase outcomes are reported to the index with their proof of payment, because that is what keeps paidfor free. On the Free plan reporting cannot be turned off; a Team plan with that switch is coming soon (https://paidfor.dev/pricing). Shown once.`);
   });
 
   it("the not-honoured line goes to a telemetryNotice function when one is given", async () => {
@@ -790,31 +792,71 @@ describe("safeFetch: verified telemetry (v2)", () => {
     expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "paid_no_response", proof: { tx_hash: null } });
   });
 
-  it("prints the privacy notice once per receipts directory, with no options too", async () => {
+  const NOTICE = "What verified telemetry sends and why";
+  const notices = () => warnings.filter((w) => w.includes(NOTICE));
+
+  it("prints the privacy notice once per receipts directory, at the first payment, with no options too", async () => {
+    // Creating a client signs nothing, so it says nothing (issue 63).
     client({ telemetryNotice: true });
     await settle();
-    expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
-    expect(warnings[0]).toMatch(/reporting is on: .*a team account on a paid plan can turn it off on its account page/);
-    client({ telemetry: "verified", telemetryNotice: true });
+    expect(notices()).toEqual([]);
+    await client({ telemetryNotice: true })(`${mock.base}/data`);
     await settle();
-    expect(warnings.filter((w) => w.includes("What verified telemetry sends and why"))).toHaveLength(1);
-    client({ telemetry: "anonymous", telemetryNotice: true });
-    expect(warnings).toHaveLength(1);
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0]).toMatch(/reporting is on: .*On the Free plan it cannot be turned off/);
+    expect(notices()[0]).not.toMatch(/paid plan can turn it off/);
+    await client({ telemetry: "verified", telemetryNotice: true })(`${mock.base}/data`);
+    const f = client({ telemetryNotice: true });
+    await f(`${mock.base}/data`);
+    await f(`${mock.base}/data`);
+    await settle();
+    expect(notices()).toHaveLength(1);
+  });
+
+  it("says nothing about reporting on a run that paid nothing (issue 63)", async () => {
+    const f = client({ telemetryNotice: true });
+    // A declined payment: the seller is rated avoid.
+    indexAnswer("check-avoid");
+    await expect(f(`${mock.base}/data`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    // A quote above the cap.
+    mock.st.index = { kind: "status", status: 503 };
+    mock.st.amount = "600000";
+    await expect(f(`${mock.base}/data`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    // An empty wallet.
+    mock.st.amount = "10000";
+    mock.st.balance = "0";
+    await expect(f(`${mock.base}/data`)).rejects.toMatchObject({ code: "insufficient_funds" });
+    // A free resource.
+    mock.st.mode = "free";
+    await f(`${mock.base}/free`);
+    await settle();
+    expect(mock.st.paidCount).toBe(0);
+    expect(notices()).toEqual([]);
+    await expect(readFile(join(dir, ".verified-telemetry-notice"), "utf8")).rejects.toThrow();
+    // The first real payment says it, once.
+    mock.st.mode = "ok";
+    mock.st.balance = "1000000";
+    await f(`${mock.base}/data`);
+    await f(`${mock.base}/data`);
+    await settle();
+    expect(mock.st.paidCount).toBe(2);
+    expect(notices()).toHaveLength(1);
+    expect(await readFile(join(dir, ".verified-telemetry-notice"), "utf8")).toMatch(/^\d{4}-/);
   });
 
   it("telemetryNotice: false never shows the notice; a function receives it instead of the logger", async () => {
-    client({ telemetry: "verified", telemetryNotice: false });
+    await client({ telemetry: "verified", telemetryNotice: false })(`${mock.base}/data`);
     await settle();
     expect(warnings).toEqual([]);
     await expect(readFile(join(dir, ".verified-telemetry-notice"), "utf8")).rejects.toThrow();
     const got: string[] = [];
-    client({ telemetry: "verified", telemetryNotice: (m) => got.push(m) });
+    await client({ telemetry: "verified", telemetryNotice: (m) => got.push(m) })(`${mock.base}/data`);
     await settle();
     expect(warnings).toEqual([]);
     expect(got).toHaveLength(1);
     expect(got[0]).toMatch(/^x402-safe-fetch: reporting is on: each purchase outcome is sent .*Shown once\.$/);
     // Shown once per directory either way.
-    client({ telemetry: "verified", telemetryNotice: true });
+    await client({ telemetry: "verified", telemetryNotice: true })(`${mock.base}/data`);
     await settle();
     expect(warnings).toEqual([]);
   });
@@ -842,5 +884,105 @@ describe("safeFetch: verified telemetry (v2)", () => {
     await settle();
     expect(seen).toHaveLength(1);
     expect(seen[0]!.redirect).toBe("error");
+  });
+});
+
+describe("safeFetch: the wallet's balance is read before signing (issue 57)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 200));
+  const balanceCall = (i = 0) => mock.st.rpcCalls[i] as { method: string; params: [{ to: string; data: string }, string] };
+
+  it("an empty wallet signs nothing, sends nothing, and the error names the wallet, the balance and the amount", async () => {
+    mock.st.balance = "0";
+    const err = (await client()(`${mock.base}/data`, {}, { intentId: "empty" }).catch((e: unknown) => e)) as InsufficientFundsError;
+    expect(err).toBeInstanceOf(InsufficientFundsError);
+    expect(err).toBeInstanceOf(SafeFetchError);
+    expect(err.code).toBe("insufficient_funds");
+    expect(err).toMatchObject({ address: account.address, balanceUsdc: "0.000000", amountUsdc: "0.010000" });
+    expect(err.message).toContain(account.address);
+    expect(err.message).toMatch(/holds 0\.000000 USDC .*needs 0\.010000 USDC/);
+    expect(err.message).toMatch(/Nothing was signed/);
+    // One unpaid request for the quote, and no payment: nothing was signed or sent.
+    expect(mock.st.unpaidCount).toBe(1);
+    expect(mock.st.paidCount).toBe(0);
+    expect(mock.st.nonces).toEqual([]);
+    expect(err.receipt).toMatchObject({ outcome: "insufficient_funds", paid: false, nonce: null, payer: null, proof: null, error: { code: "insufficient_funds" } });
+    // balanceOf(wallet) on the quoted asset, at the latest block.
+    expect(balanceCall()).toEqual({
+      method: "eth_call",
+      params: [{ to: USDC_SEPOLIA.toLowerCase(), data: `0x70a08231${"0".repeat(24)}${account.address.slice(2).toLowerCase()}` }, "latest"],
+    });
+    // A wallet that cannot pay says nothing about the seller: no row.
+    await settle();
+    expect(mock.st.telemetry).toEqual([]);
+  });
+
+  it("a balance one unit short refuses; exactly the amount pays", async () => {
+    mock.st.balance = "9999";
+    await expect(client()(`${mock.base}/data`)).rejects.toMatchObject({ code: "insufficient_funds", balanceUsdc: "0.009999" });
+    expect(mock.st.paidCount).toBe(0);
+    mock.st.balance = "10000";
+    const res = await client()(`${mock.base}/data`);
+    expect(res.receipt).toMatchObject({ outcome: "ok", paid: true });
+    expect(mock.st.paidCount).toBe(1);
+  });
+
+  it("the same intentId pays once the wallet is funded", async () => {
+    mock.st.balance = "0";
+    const f = client();
+    await expect(f(`${mock.base}/data`, {}, { intentId: "fund-me" })).rejects.toMatchObject({ code: "insufficient_funds" });
+    mock.st.balance = "50000";
+    const res = await f(`${mock.base}/data`, {}, { intentId: "fund-me" });
+    expect(res.receipt).toMatchObject({ outcome: "ok", paid: true });
+    expect(mock.st.paidCount).toBe(1);
+    // A paid call is still reported, as before.
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+    expect(mock.st.telemetry[0]).toMatchObject({ v: 2, outcome: "ok", proof: { payer: account.address.toLowerCase() } });
+  });
+
+  it.each([
+    ["an HTTP 500", { kind: "status", status: 500 }],
+    ["a JSON-RPC error", { kind: "rpc_error" }],
+    ["an unreadable answer", { kind: "raw", body: "not json" }],
+    ["a result that is not a number", { kind: "raw", body: JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0xzz" }) }],
+  ] as const)("a balance read that fails (%s) does not block the payment, and one line says so", async (_label, balance) => {
+    mock.st.balance = balance;
+    const res = await client()(`${mock.base}/data`);
+    expect(res.receipt).toMatchObject({ outcome: "ok", paid: true });
+    expect(mock.st.paidCount).toBe(1);
+    expect(warnings.filter((w) => w.includes("balance could not be read"))).toHaveLength(1);
+    await settle();
+    expect(mock.st.telemetry).toHaveLength(1);
+  });
+
+  it("an RPC that does not answer is given up after balanceTimeoutMs and the payment goes ahead", async () => {
+    mock.st.balance = "hang";
+    const t0 = Date.now();
+    const res = await client({ balanceTimeoutMs: 300 })(`${mock.base}/data`);
+    expect(res.receipt.paid).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(warnings.filter((w) => w.includes("balance could not be read"))).toHaveLength(1);
+  });
+
+  it("rpcUrl: false skips the read", async () => {
+    mock.st.balance = "0";
+    const res = await client({ rpcUrl: false })(`${mock.base}/data`);
+    expect(res.receipt.paid).toBe(true);
+    expect(mock.st.rpcCalls).toEqual([]);
+  });
+
+  it("a payment refused before the balance (avoid seller, cap) never reads it", async () => {
+    indexAnswer("check-avoid");
+    await expect(client()(`${mock.base}/data`)).rejects.toBeInstanceOf(PaymentRefusedError);
+    mock.st.index = { kind: "status", status: 503 };
+    mock.st.amount = "600000";
+    await expect(client()(`${mock.base}/data`)).rejects.toMatchObject({ code: "refused_max_per_call" });
+    expect(mock.st.rpcCalls).toEqual([]);
+  });
+
+  it("rejects a bad rpcUrl or balanceTimeoutMs when safeFetch is called", () => {
+    expect(() => client({ rpcUrl: "not a url" })).toThrow(/rpcUrl/);
+    expect(() => client({ rpcUrl: "ftp://x/" })).toThrow(/rpcUrl/);
+    expect(() => client({ balanceTimeoutMs: 0 })).toThrow(/balanceTimeoutMs/);
   });
 });

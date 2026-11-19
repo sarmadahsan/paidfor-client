@@ -16,7 +16,7 @@ import type { ClientEvmSigner } from "@x402/evm";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { wrapFetchWithPayment } from "@x402/fetch";
 import { readBodyTee } from "./body.js";
-import { IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type SafeFetchErrorCode } from "./errors.js";
+import { InsufficientFundsError, IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type SafeFetchErrorCode } from "./errors.js";
 import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
@@ -59,10 +59,11 @@ export interface SafeFetchOptions {
    * Reporting each outcome to the index. On by default: the v2 payload in docs/telemetry.md, the outcome with a proof
    * of payment (payer, nonce, pay-to, tx hash) the index checks on Base. paidfor is free because these reports feed it.
    *
-   * The account decides, not this option: reporting stops only for a client in team mode whose account is on a paid
-   * plan and turned reporting off on its account page (the server says so in every authorize answer). "anonymous" and
-   * "off" ask for less than that; without such an account they are not honoured: verified rows are still sent and one
-   * line says so, once per process. Never a throw. `indexUrl: false` sends nothing (and checks no seller).
+   * The account decides, not this option: reporting stops only for a client in team mode whose account turned reporting
+   * off (the server says so in every authorize answer). On the Free plan that switch does not exist; the Team plan that
+   * will have it is coming soon. "anonymous" and "off" ask for less; without such an account they are not honoured:
+   * verified rows are still sent and one line says so, once per process. Never a throw. `indexUrl: false` sends nothing
+   * (and checks no seller).
    */
   telemetry?: "anonymous" | "verified" | "off";
   /** Receipts, intents, price book and debug log. Default "./.x402-receipts" (resolved once, at creation). */
@@ -81,6 +82,16 @@ export interface SafeFetchOptions {
    * an MCP server, whose client may show anything on stderr as an error.
    */
   telemetryNotice?: boolean | ((msg: string) => void);
+  /**
+   * The JSON-RPC endpoint the wallet's balance of the quoted asset (USDC) is read from, after the local checks and before
+   * anything is signed. With less than the quote, nothing is signed and InsufficientFundsError (`insufficient_funds`) is
+   * thrown. Default https://mainnet.base.org on Base, https://sepolia.base.org on Base Sepolia. The read sends the wallet
+   * address and the asset contract to that endpoint. A read that fails or takes longer than `balanceTimeoutMs` does not
+   * block the payment. `false` skips the read.
+   */
+  rpcUrl?: string | false;
+  /** How long the balance read may take before the payment goes ahead without it. Default 4000 ms. */
+  balanceTimeoutMs?: number;
   /**
    * Asks someone else whether this payment may go ahead, after every local check has passed and before anything is
    * signed. An approval names the EIP-3009 nonce and `validBefore` to sign. Anything but a well-formed approval,
@@ -117,6 +128,16 @@ export interface AuthorizeRequest {
 export type AuthorizeAnswer =
   | { approve: true; /** 32 bytes of 0x-hex. */ nonce: `0x${string}`; /** Unix seconds. */ validBefore: number }
   | { approve: false; message: string };
+
+/** Public JSON-RPC endpoints the balance is read from by default. */
+const RPC_BY_NETWORK: Readonly<Record<SafeNetwork, string>> = {
+  "eip155:8453": "https://mainnet.base.org",
+  "eip155:84532": "https://sepolia.base.org",
+};
+const NETWORK_NAME: Readonly<Record<SafeNetwork, string>> = { "eip155:8453": "Base", "eip155:84532": "Base Sepolia" };
+/** ERC-20 balanceOf(address). */
+const BALANCE_OF_SELECTOR = "0x70a08231";
+const DEFAULT_BALANCE_TIMEOUT_MS = 4000;
 
 /** A facilitator refuses an authorization about to lapse, so an approval with less than this left is not signed. */
 const MIN_AUTH_SECONDS_LEFT = 10;
@@ -208,7 +229,7 @@ export function resetOnceNotices(): void {
 /** Said when `telemetry: "anonymous"` or `"off"` is not honoured: no account, or an account whose plan does not allow it. */
 export const TELEMETRY_NOT_HONOURED = (asked: string) =>
   `telemetry: "${asked}" is not honoured: purchase outcomes are reported to the index with their proof of payment, because that is what keeps paidfor free. ` +
-  "Only a team account on a paid plan can turn reporting off, on its account page (https://paidfor.dev/team); plans: https://paidfor.dev/pricing. Shown once.";
+  "On the Free plan reporting cannot be turned off; a Team plan with that switch is coming soon (https://paidfor.dev/pricing). Shown once.";
 
 /** A project tag as the server takes it, or a TypeError naming where the bad one came from. */
 function projectTag(v: unknown, from: string): string {
@@ -315,6 +336,18 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const indexTimeoutMs = options.indexTimeoutMs ?? 2000;
   const logger = options.logger ?? console;
   const maxAtomic = usdToAtomic(options.maxPerCallUsd);
+  const rpcUrl = options.rpcUrl === false ? undefined : (options.rpcUrl ?? RPC_BY_NETWORK[network]);
+  if (rpcUrl !== undefined) {
+    let ok = false;
+    try {
+      ok = ["https:", "http:"].includes(new URL(rpcUrl).protocol);
+    } catch {
+      /* not a URL */
+    }
+    if (!ok) throw new TypeError(`safeFetch: rpcUrl must be an http(s) URL or false, got ${JSON.stringify(rpcUrl)}`);
+  }
+  const balanceTimeoutMs = options.balanceTimeoutMs ?? DEFAULT_BALANCE_TIMEOUT_MS;
+  if (!(Number.isFinite(balanceTimeoutMs) && balanceTimeoutMs > 0)) throw new TypeError("safeFetch: balanceTimeoutMs must be a positive number");
   const intents = new IntentStore(receiptsDir);
   const prices = new PriceBook(receiptsDir);
   const teamConf = resolveTeam(options);
@@ -328,7 +361,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   };
 
   const noticeOpt = options.telemetryNotice ?? true;
-  if (reporting && noticeOpt !== false) void verifiedNotice();
+  /** The reporting notice waits for the first payment about to be signed (issue 63); once per client, and per directory. */
+  let noticeStarted = false;
   if (indexUrl !== undefined && !secureIndex && !insecureNoticeShown) {
     insecureNoticeShown = true;
     warn(`nothing is reported to ${indexUrl}: outcome reports carry the payer and nonce and go only to an https index (or a loopback one).`);
@@ -362,7 +396,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     const text =
       "reporting is on: each purchase outcome is sent with its proof of payment (payer address, nonce, pay-to, tx hash) " +
       `to ${indexUrl}/telemetry so the index can check it on Base. No bodies, request parameters, IP or identity. ` +
-      "This is what keeps paidfor free; a team account on a paid plan can turn it off on its account page. " +
+      "This is what keeps paidfor free. On the Free plan it cannot be turned off; indexUrl: false sends nothing and also turns off the seller check. " +
       'See "What verified telemetry sends and why": https://www.npmjs.com/package/@paidfor/x402-safe-fetch#what-verified-telemetry-sends-and-why. Shown once.';
     if (typeof noticeOpt === "function") {
       try {
@@ -376,6 +410,31 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       await writeFile(marker, `${new Date().toISOString()}\n`);
     } catch {
       /* shown again next run; harmless */
+    }
+  }
+
+  /**
+   * The wallet's balance of `asset` (atomic units), read with eth_call balanceOf at the latest block, or null when there
+   * is no endpoint or the read fails: a failed read never blocks a payment, it only loses this check.
+   */
+  async function readBalance(asset: string): Promise<bigint | null> {
+    if (rpcUrl === undefined) return null;
+    try {
+      const data = BALANCE_OF_SELECTOR + signer.address.slice(2).toLowerCase().padStart(64, "0");
+      const res = await baseFetch(rpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: asset.toLowerCase(), data }, "latest"] }),
+        signal: AbortSignal.timeout(balanceTimeoutMs),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = (await res.json()) as { result?: unknown; error?: { message?: unknown } } | null;
+      if (j?.error) throw new Error(`RPC error ${String(j.error.message ?? "")}`.slice(0, 200));
+      if (typeof j?.result !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(j.result)) throw new Error("the answer carries no balance");
+      return BigInt(j.result);
+    } catch (e) {
+      warn(`the wallet's balance could not be read before paying (${errMsg(e).slice(0, 200)}); paying without that check`);
+      return null;
     }
   }
 
@@ -423,7 +482,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   function emitTelemetry(r: Receipt) {
     if (!indexUrl || !reportsNow(r)) return;
     // Nothing was paid and the seller is not at fault for a wallet that cannot pay; the contract has no outcome for it.
-    if (r.outcome === "payment_rejected") return;
+    // Nor for a wallet found short before signing (issue 57): nothing was signed.
+    if (r.outcome === "payment_rejected" || r.outcome === "insufficient_funds") return;
     lessNotice();
     try {
       const payload = buildPayloadV2({
@@ -576,6 +636,8 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     const priorRejected = lease.record.rejected;
     let authSigned = false;
     let failure: { code: SafeFetchErrorCode; message: string } | undefined;
+    // Set when the wallet held less than the quote: what it held and what was needed (atomic).
+    let short: { have: bigint; need: bigint } | undefined;
     let signingStarted = false;
     let signedRecorded = false;
     let sent = false;
@@ -728,7 +790,22 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         }
       }
 
-      // 5. Last, so a payment refused above never takes up a reservation with whoever approves it.
+      // 5. The wallet's balance of the quoted asset (issue 57). With less than the quote the seller can only reject the
+      // payment, and a signed authorization would stay usable until its deadline, so nothing is signed. Read before the
+      // approval, so an empty wallet takes up no reservation. A read that fails does not block the payment.
+      const have = await readBalance(norm.asset);
+      if (have !== null && have < amount) {
+        short = { have, need: amount };
+        failure = {
+          code: "insufficient_funds",
+          message:
+            `refused to pay ${usd} for ${req.url}: the wallet ${signer.address} holds ${atomicToUsdc(have)} USDC on ${NETWORK_NAME[network]} ` +
+            `and this payment needs ${atomicToUsdc(amount)} USDC. Nothing was signed. Fund the wallet, then call again (the same intentId is safe).`,
+        };
+        return { abort: true, reason: failure.message };
+      }
+
+      // 6. Last, so a payment refused above never takes up a reservation with whoever approves it.
       if (authorize) {
         let answer: AuthorizeAnswer;
         try {
@@ -746,7 +823,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         auth = { nonce: answer.nonce, validBefore: BigInt(answer.validBefore) };
       }
 
-      // 6. A rejected authorization of this intent can still be used until its deadline. Signing its nonce again (same
+      // 7. A rejected authorization of this intent can still be used until its deadline. Signing its nonce again (same
       // payer, network and asset, checked above) means at most one of the two can ever move money. An approval with
       // another nonce waits for that deadline; the deadline only stops later use of the old signature and does not show
       // that it was never used. authorizationState(payer, nonce) false on chain shows that; true means used or cancelled,
@@ -777,6 +854,12 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       }
       if (i.available && i.verdict === "caution") {
         warn(`paying ${host}, which paidfor.dev rates "caution": ${i.verdict_text ?? ""}${sellerLink}`);
+      }
+      // The first payment about to be signed with reporting on says what reporting sends; a run that pays nothing
+      // (a refusal, an empty wallet, a free resource) says nothing about it (issue 63).
+      if (!noticeStarted && noticeOpt !== false && reportsNow(r)) {
+        noticeStarted = true;
+        void verifiedNotice();
       }
       return undefined;
     });
@@ -902,12 +985,15 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         code = "sdk";
         message = errMsg(e);
       }
-      finish(r, t0, code === "no_acceptable_quote" ? "no_acceptable_quote" : "error");
+      finish(r, t0, code === "no_acceptable_quote" || code === "insufficient_funds" ? code : "error");
       r.error = { code, message };
       attachProof(r, undefined, {});
       await lease.update({ phase: "failed_unpaid" }).catch(() => undefined);
       await persistReceipt(r);
       if (quoteResult) emitTelemetry(r);
+      if (code === "insufficient_funds" && short) {
+        throw new InsufficientFundsError(`x402-safe-fetch: ${message}`, signer.address, atomicToUsdc(short.have), atomicToUsdc(short.need), r);
+      }
       if (code === "intent_conflict") throw new IntentConflictError(code, `x402-safe-fetch: ${message}`, r, { cause: e });
       throw new SafeFetchError(code, `x402-safe-fetch: ${message}`, r, { cause: e });
     }
