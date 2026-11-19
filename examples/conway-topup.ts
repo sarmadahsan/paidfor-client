@@ -6,7 +6,7 @@
  * authorization, and each one settled. One top-up, many payments.
  *
  * What changes with safeFetch:
- *   1. Every top-up carries a stable intentId (account + billing period). The first call stores the request hash
+ *   1. Every top-up carries one intentId, minted once (with a random part) and kept across its retries. The first call stores the request hash
  *      and, before sending, the signed nonce. A retry with the same intentId and request returns the stored
  *      response and never signs again.
  *   2. The http_status validator marks the paid 500 as a failure in res.receipt, with the settlement tx hash,
@@ -20,6 +20,7 @@ import type { AddressInfo } from "node:net";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { safeFetch } from "@paidfor/x402-safe-fetch";
 
@@ -62,14 +63,18 @@ const fetchWithPay = safeFetch(wallet, {
   indexUrl: false, // the example runs offline; leave the default (https://paidfor.dev/v1) in production
   // Report each outcome with its proof of payment, so paidfor.dev can verify on Base that this paid 500 really
   // happened and count it against the seller. Sends no bodies or request parameters; the payer address is already
-  // public on-chain. Needs indexUrl (sends nothing here, offline). "anonymous" drops the proof, "off" sends nothing.
+  // public on-chain. On by default; needs indexUrl (sends nothing here, offline).
   telemetry: "verified",
   network: "eip155:84532",
+  // The wallet here is a throwaway key holding nothing, and the local seller never settles, so the balance read before
+  // signing is skipped. Leave it out in production: an empty wallet then stops before anything is signed.
+  rpcUrl: false,
   receiptsDir: await mkdtemp(join(tmpdir(), "conway-receipts-")),
 });
 
-// One intent per account per billing period: the same top-up, however many times the loop fires.
-const intentId = `conway-topup:acct_42:2026-10-28`;
+// One intent per top-up, minted once with a random part and kept for every retry of that top-up. A new top-up gets a
+// new id: an id made only of the account and the date would replay the first top-up instead of paying for the second.
+const intentId = `conway-topup:acct_42:${randomUUID()}`;
 const init = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account: "acct_42", amount_usd: 5 }) };
 
 // The auto-top-up loop. In the incident this ran every 60 seconds; here every 100 ms, five times.

@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { TelemetryOutcome, TelemetryProof } from "./proof.js";
 import { REFUSED_OUTCOMES } from "./proof.js";
 
-export const CLIENT_ID = "x402-safe-fetch/0.7.1";
+export const CLIENT_ID = "x402-safe-fetch/0.7.2";
 /** Sent on every request to the index so it can count calls per client. Carries only CLIENT_ID. */
 export const CLIENT_HEADER = "X-Paidfor-Client";
 

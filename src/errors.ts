@@ -7,6 +7,7 @@ export type SafeFetchErrorCode =
   | "refused_max_per_call"
   | "refused_authorize"
   | "no_acceptable_quote"
+  | "insufficient_funds"
   | "intent_conflict"
   | "intent_indeterminate"
   | "intent_in_flight"
@@ -56,6 +57,26 @@ export class TeamRefusedError extends PaymentRefusedError {
     receipt?: Receipt,
   ) {
     super("refused_authorize", message, sellerUrl, receipt);
+  }
+}
+
+/**
+ * The wallet holds less of the quoted asset than the quote asks for, read on chain before signing. Nothing was signed
+ * or sent; a retry with the same intentId once the wallet is funded pays normally. Code `insufficient_funds`.
+ */
+export class InsufficientFundsError extends SafeFetchError {
+  override name = "InsufficientFundsError";
+  constructor(
+    message: string,
+    /** The wallet that would have paid (checksummed, as the signer gives it). */
+    readonly address: string,
+    /** Its balance of the quoted asset, in USDC ("0.000000"). */
+    readonly balanceUsdc: string,
+    /** What the quote asks for, in USDC. */
+    readonly amountUsdc: string,
+    receipt?: Receipt,
+  ) {
+    super("insufficient_funds", message, receipt);
   }
 }
 

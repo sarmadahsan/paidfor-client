@@ -85,6 +85,8 @@ function client({ noTeam, ...o }: Partial<SafeFetchOptions> & { noTeam?: boolean
     receiptsDir: dir,
     network: NETWORK,
     telemetryNotice: false,
+    // The wallet balance is read from the mock RPC; it answers a large balance unless a test says otherwise.
+    rpcUrl: `${mock.base}/rpc`,
     fetch: fakeFetch,
     logger: { warn: (m) => warnings.push(m) },
     ...(noTeam ? {} : { team: { key: KEY, origin: ORIGIN } }),
@@ -566,6 +568,19 @@ describe("team mode: refusals made before asking the team", () => {
   });
 });
 
+describe("team mode: an empty wallet (issue 57)", () => {
+  it("is refused before the team is asked: no approval is reserved, nothing is signed", async () => {
+    mock.st.balance = "0";
+    const err = (await client()(`${mock.base}/data`).catch((e: unknown) => e)) as { code?: string; receipt?: { team?: unknown } };
+    expect(err.code).toBe("insufficient_funds");
+    expect(teamCalls("/v1/team/authorize")).toEqual([]);
+    expect(teamCalls("/v1/team/outcome")).toEqual([]);
+    expect(teamCalls("/v1/team/refusals")).toEqual([]);
+    expect(signedAuth()).toEqual([]);
+    expect(mock.st.paidCount).toBe(0);
+  });
+});
+
 describe("team mode: project", () => {
   it("sends team.project, trimmed, on every authorize", async () => {
     await client({ team: { key: KEY, origin: ORIGIN, project: "  research-q4 " } })(`${mock.base}/x`);
@@ -634,6 +649,22 @@ describe("team mode: reporting to the index follows the account (issue 41)", () 
     // The team's own ledger still hears about it.
     expect(teamCalls("/v1/team/outcome")).toHaveLength(1);
     expect(warnings.filter((w) => w.includes("not honoured"))).toEqual([]);
+  });
+
+  it("a paid team that turned reporting off is not told that reporting is on (issue 63)", async () => {
+    authorizeAnswer = approve(PAID_OFF);
+    await client({ telemetryNotice: true })(`${mock.base}/data`);
+    await settle();
+    expect(warnings.filter((w) => w.includes("reporting is on"))).toEqual([]);
+  });
+
+  it("a free team hears that reporting is on at its first payment, once", async () => {
+    authorizeAnswer = approve(FREE);
+    const f = client({ telemetryNotice: true });
+    await f(`${mock.base}/data`);
+    await f(`${mock.base}/data`);
+    await settle();
+    expect(warnings.filter((w) => w.includes("reporting is on"))).toHaveLength(1);
   });
 
   it("the account decides even when the code asks for verified", async () => {

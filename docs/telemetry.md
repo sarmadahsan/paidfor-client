@@ -2,8 +2,9 @@
 
 Telemetry is **on by default** (since 0.7.0; issue
 [sarmadahsan/paidfor-index#41](https://github.com/sarmadahsan/paidfor-index/issues/41)): `safeFetch` sends a v2 row,
-the v1 fields plus a proof of payment (see "Version 2"). Only a team account on a paid plan can turn it off, on its
-account page; the server says so in each `/v1/team/authorize` answer (`telemetry.report: "off"`). `telemetry:
+the v1 fields plus a proof of payment (see "Version 2"). On the Free plan it cannot be turned off. The Team plan,
+coming soon, will have a switch for it on the account page; the server says what applies in each `/v1/team/authorize`
+answer (`telemetry.report: "off"` only where that switch is off). `telemetry:
 "anonymous"` and `"off"` are not honoured on their own, and `safeFetch` no longer sends the v1 row (below), which the
 index still accepts from older versions. The report-only adapters send the tx_only row (see "tx_only (report-only)").
 
