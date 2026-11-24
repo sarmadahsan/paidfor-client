@@ -55,7 +55,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          cache: pnpm
+          # No cache: most runs stop at step a or b without installing anything, and the action's post-run cache
+          # save then fails on a missing pnpm store and marks a correct run red. The one install on a publish run
+          # takes seconds.
           # No registry-url: it would write an .npmrc that expects NODE_AUTH_TOKEN. Trusted publishing exchanges
           # the job's OIDC token for a short-lived publish credential; no token is set anywhere in this workflow.
 
