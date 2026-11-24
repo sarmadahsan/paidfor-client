@@ -76,6 +76,18 @@ export interface LedgerFile {
 
 const isAtomic = (v: unknown): v is string => typeof v === "string" && /^\d+$/.test(v);
 const atomic = (v: unknown): bigint => (isAtomic(v) ? BigInt(v) : 0n);
+const isMap = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+/** Whether `j` has the shape of a version 1 ledger: maps where maps are expected, atomic strings where amounts are. Anything else is not written over. */
+function isLedgerFile(j: unknown): j is LedgerFile {
+  if (!isMap(j) || j.v !== 1 || !isMap(j.days) || !isMap(j.sellers)) return false;
+  for (const row of Object.values(j.days)) {
+    if (!isMap(row) || !isAtomic(row.settled_atomic) || !isMap(row.by_seller) || !isMap(row.pending)) return false;
+    if (!Object.values(row.by_seller).every(isAtomic)) return false;
+    if (!Object.values(row.pending).every((p) => isMap(p) && isAtomic(p.amount_atomic) && typeof p.seller === "string")) return false;
+  }
+  return Object.values(j.sellers).every((h) => isMap(h) && typeof h.first_paid_at === "string" && typeof h.last_paid_at === "string");
+}
 
 /** The UTC day of `d` as YYYY-MM-DD. */
 export function utcDay(d: Date): string {
@@ -108,7 +120,7 @@ export class SpendLedger {
 
   /**
    * The ledger as on disk, or an empty one when there is no file. Not locked: for reading only. A file that is not a
-   * version 1 ledger (another version, not JSON, not an object) throws, so it is never replaced by an empty one.
+   * version 1 ledger (another version, not JSON, a map or an amount of the wrong shape) throws, so it is never written over.
    */
   async read(): Promise<LedgerFile> {
     let text: string;
@@ -119,11 +131,8 @@ export class SpendLedger {
       throw e;
     }
     const j = JSON.parse(text) as unknown;
-    if (!(j && typeof j === "object" && !Array.isArray(j) && (j as LedgerFile).v === 1)) {
-      throw new Error(`${this.file} is not a version 1 spend ledger; not replacing it`);
-    }
-    const f = j as LedgerFile;
-    return { v: 1, days: f.days && typeof f.days === "object" ? f.days : {}, sellers: f.sellers && typeof f.sellers === "object" ? f.sellers : {} };
+    if (!isLedgerFile(j)) throw new Error(`${this.file} is not a version 1 spend ledger; not replacing it`);
+    return { v: 1, days: j.days, sellers: j.sellers };
   }
 
   /** The file lock, waited for briefly while another live process holds it (it covers one read and one write). */

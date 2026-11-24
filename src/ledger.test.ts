@@ -142,7 +142,22 @@ describe("SpendLedger", () => {
   });
 
   it("a ledger file that is not a version 1 ledger is never replaced by an empty one", async () => {
-    for (const content of ["{not json", JSON.stringify({ v: 2, days: {}, sellers: {} }), "{}", "null", "[]"]) {
+    const bad = [
+      "{not json",
+      "{}",
+      "null",
+      "[]",
+      { v: 2, days: {}, sellers: {} },
+      { v: 1, days: [], sellers: {} },
+      { v: 1, days: {}, sellers: [] },
+      { v: 1, days: { "2026-11-23": [] }, sellers: {} },
+      { v: 1, days: { "2026-11-23": { settled_atomic: 5, by_seller: {}, pending: {} } }, sellers: {} },
+      { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: { a: "x" }, pending: {} } }, sellers: {} },
+      { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: {}, pending: { p: { amount_atomic: "1" } } } }, sellers: {} },
+      { v: 1, days: {}, sellers: { h: { first_paid_at: 1 } } },
+    ];
+    for (const b of bad) {
+      const content = typeof b === "string" ? b : JSON.stringify(b);
       await writeFile(join(dir, "spend.json"), content);
       const l = new SpendLedger(dir);
       await expect(l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps: { perDay: 10n }, unlisted: false, known: true })).rejects.toThrow();
