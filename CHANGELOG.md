@@ -20,7 +20,9 @@ leaves `reported_outcome` null. See "Caps and switches" in the README.
    In team mode the cap applies as well, before the team is asked. The lock code moved to `src/fsutil.ts`
    (`acquireLock`): the lock file is now created by hard link with its content complete, a stale lock is claimed by
    rename before it is removed, and release removes only the lock this acquisition took; the intent store uses it too,
-   and its in-flight guard is now shared by every store in the process.
+   and its in-flight guard is now shared by every store in the process. The ledger waits up to two seconds for another
+   live process to let go of its lock, and never replaces a `spend.json` it cannot read as a version 1 ledger. The
+   receipts directory needs hard links and one host and pid namespace (README, "Receipts directory").
 2. **Pay-to check.** When the index's `/check` answer carries the seller's `pay_to_addresses` (as `/v1/sellers` and
    `/v1/seller/{domain}` already do) and the quote's `pay_to` is not among them, the receipt gets a warning
    `unknown_pay_to` (`pay_to`, `known_pay_to`, `message`) and the v2 row carries the code in `warnings`; the call pays.

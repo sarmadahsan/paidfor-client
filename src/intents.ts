@@ -109,8 +109,12 @@ export class IntentStore {
       throw e;
     }
     return async () => {
-      inFlight.delete(key);
-      await unlock();
+      // The file lock goes first: until it is gone, a second call in this process must still see the intent in flight.
+      try {
+        await unlock();
+      } finally {
+        inFlight.delete(key);
+      }
     };
   }
 
@@ -120,7 +124,9 @@ export class IntentStore {
       owner === undefined
         ? new SafeFetchError("intent_in_flight", `could not lock intent ${intentId}`)
         : new SafeFetchError("intent_in_flight", `intent ${intentId} is in flight in process ${owner}`),
-    );
+    ).catch((e: unknown) => {
+      throw e instanceof SafeFetchError ? e : new SafeFetchError("intent_in_flight", `could not lock intent ${intentId}: ${e instanceof Error ? e.message : String(e)}`, undefined, { cause: e });
+    });
   }
 
   async read(intentId: string): Promise<IntentRecord | undefined> {

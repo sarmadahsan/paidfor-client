@@ -16,6 +16,8 @@ export async function writeJsonDurable(file: string, value: unknown): Promise<vo
   await rename(tmp, file);
 }
 
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -31,12 +33,31 @@ interface LockOwner {
   token?: string;
 }
 
+/** The lock's owner; undefined when the file is gone or not JSON. Any other read error (permissions, I/O) is thrown: ownership could not be verified, so nothing may be reclaimed. */
 async function readOwner(file: string): Promise<LockOwner | undefined> {
+  let text: string;
   try {
-    const o = JSON.parse(await readFile(file, "utf8")) as unknown;
+    text = await readFile(file, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+  try {
+    const o = JSON.parse(text) as unknown;
     return o && typeof o === "object" ? (o as LockOwner) : undefined;
   } catch {
-    return undefined; // gone, or not JSON
+    return undefined; // not JSON
+  }
+}
+
+/** Thrown by acquireLock when another live process holds the lock (`owner`), or when it could not be taken (undefined). */
+export class LockBusyError extends Error {
+  override name = "LockBusyError";
+  constructor(
+    readonly file: string,
+    readonly owner: number | undefined,
+  ) {
+    super(owner === undefined ? `could not take the lock ${file}` : `${file} is held by process ${owner}`);
   }
 }
 
@@ -50,7 +71,8 @@ const isLive = (o: LockOwner | undefined): o is LockOwner & { pid: number } => o
  * it is deleted; a live lock that slipped in meanwhile is given back. Release removes the lock only while it still
  * carries this acquisition's token. `busy(owner)` makes the error thrown when another live process holds it (`owner`
  * undefined when the lock could not be taken after stale ones were cleared). Within one process the caller keeps its own
- * guard: this lock treats its own pid as stale. Returns the release function.
+ * guard: this lock treats its own pid as stale. Needs a filesystem with hard links, and a directory shared only within
+ * one host and pid namespace (a pid that is absent here is taken for dead). Returns the release function.
  */
 export async function acquireLock(lockFile: string, busy: (owner: number | undefined) => Error): Promise<() => Promise<void>> {
   await mkdir(dirname(lockFile), { recursive: true });
@@ -60,7 +82,13 @@ export async function acquireLock(lockFile: string, busy: (owner: number | undef
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await link(tmp, lockFile);
+        try {
+          await link(tmp, lockFile);
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code === "EEXIST") throw e;
+          throw new Error(`could not create the lock ${lockFile} as a hard link (${code ?? errText(e)}); the receipts directory needs a filesystem with hard links`, { cause: e });
+        }
         return async () => {
           if ((await readOwner(lockFile))?.token !== token) return; // not ours any more (or already gone)
           await unlink(lockFile).catch(() => undefined);

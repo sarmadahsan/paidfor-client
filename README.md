@@ -339,7 +339,10 @@ sent, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, w
 whether the index has verified your row on-chain (usually within about five minutes of the payment).
 `reported_outcome` is the outcome under the harness names, as the row reports it.
 
-Keep this directory if you want the idempotency guarantee to survive restarts.
+Keep this directory if you want the idempotency guarantee to survive restarts. The intent and spend-ledger locks are
+files created by hard link and freed by pid: the directory needs a filesystem with hard links (not FAT or exFAT), and
+must be shared only by processes on one host, in one pid namespace (not across containers or machines), since a pid
+that is absent here is taken for a dead holder and its lock is reclaimed.
 
 ## Telemetry
 

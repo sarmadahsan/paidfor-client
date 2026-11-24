@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -125,19 +125,29 @@ describe("SpendLedger", () => {
     expect((await file()).days["2026-11-23"]!.pending).toEqual({});
   });
 
-  it("a lock held by another live process fails the call; a lock from a dead process is stale", async () => {
+  it("a lock held by another live process is waited for about two seconds, then fails the call; a lock from a dead process is stale", async () => {
     const l = new SpendLedger(dir);
     const caps = { perDay: 10_000n };
     await writeFile(join(dir, "spend.lock"), JSON.stringify({ pid: 1, at: Date.now() }));
+    const t0 = Date.now();
     await expect(l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps, unlisted: false, known: true })).rejects.toThrow(/locked by process 1/);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(1500);
+    expect(Date.now() - t0).toBeLessThan(4000);
+    // A lock let go of while waiting: the call goes through.
+    await writeFile(join(dir, "spend.lock"), JSON.stringify({ pid: 1, at: Date.now() }));
+    setTimeout(() => void unlink(join(dir, "spend.lock")), 300);
+    expect((await l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps, unlisted: false, known: true })).ok).toBe(true);
     await writeFile(join(dir, "spend.lock"), JSON.stringify({ pid: 2 ** 22 + 12345, at: Date.now() }));
     expect((await l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps, unlisted: false, known: true })).ok).toBe(true);
   });
 
-  it("an unreadable ledger file is not silently replaced", async () => {
-    await writeFile(join(dir, "spend.json"), "{not json");
-    const l = new SpendLedger(dir);
-    await expect(l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps: { perDay: 10n }, unlisted: false, known: true })).rejects.toThrow();
+  it("a ledger file that is not a version 1 ledger is never replaced by an empty one", async () => {
+    for (const content of ["{not json", JSON.stringify({ v: 2, days: {}, sellers: {} }), "{}", "null", "[]"]) {
+      await writeFile(join(dir, "spend.json"), content);
+      const l = new SpendLedger(dir);
+      await expect(l.reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps: { perDay: 10n }, unlisted: false, known: true })).rejects.toThrow();
+      expect(await readFile(join(dir, "spend.json"), "utf8")).toBe(content);
+    }
   });
 
   it("sellerKey is the pay-to address, lowercase, or the host when the quote names no address", () => {

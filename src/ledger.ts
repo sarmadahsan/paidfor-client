@@ -13,7 +13,11 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { acquireLock, writeJsonDurable } from "./fsutil.js";
+import { LockBusyError, acquireLock, writeJsonDurable } from "./fsutil.js";
+
+/** How long a call waits for another live process to let go of spend.lock before giving up. The lock covers one read and one write. */
+const LOCK_WAIT_MS = 2000;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface LedgerCaps {
   /** `maxPerDayUsd` in atomic USDC. */
@@ -102,18 +106,39 @@ export class SpendLedger {
     this.lock = join(dir, "spend.lock");
   }
 
-  /** The ledger as on disk, or an empty one. Not locked: for reading only. */
+  /**
+   * The ledger as on disk, or an empty one when there is no file. Not locked: for reading only. A file that is not a
+   * version 1 ledger (another version, not JSON, not an object) throws, so it is never replaced by an empty one.
+   */
   async read(): Promise<LedgerFile> {
+    let text: string;
     try {
-      const j = JSON.parse(await readFile(this.file, "utf8")) as unknown;
-      if (j && typeof j === "object" && !Array.isArray(j) && (j as LedgerFile).v === 1) {
-        const f = j as LedgerFile;
-        return { v: 1, days: f.days && typeof f.days === "object" ? f.days : {}, sellers: f.sellers && typeof f.sellers === "object" ? f.sellers : {} };
-      }
+      text = await readFile(this.file, "utf8");
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return { v: 1, days: {}, sellers: {} };
+      throw e;
     }
-    return { v: 1, days: {}, sellers: {} };
+    const j = JSON.parse(text) as unknown;
+    if (!(j && typeof j === "object" && !Array.isArray(j) && (j as LedgerFile).v === 1)) {
+      throw new Error(`${this.file} is not a version 1 spend ledger; not replacing it`);
+    }
+    const f = j as LedgerFile;
+    return { v: 1, days: f.days && typeof f.days === "object" ? f.days : {}, sellers: f.sellers && typeof f.sellers === "object" ? f.sellers : {} };
+  }
+
+  /** The file lock, waited for briefly while another live process holds it (it covers one read and one write). */
+  private async acquire(): Promise<() => Promise<void>> {
+    const deadline = Date.now() + LOCK_WAIT_MS;
+    for (let wait = 25; ; wait = Math.min(100, wait * 2)) {
+      try {
+        return await acquireLock(this.lock, (owner) => new LockBusyError(this.lock, owner));
+      } catch (e) {
+        if (!(e instanceof LockBusyError) || e.owner === undefined || Date.now() + wait > deadline) {
+          throw e instanceof LockBusyError ? new Error(e.owner === undefined ? "could not lock the spend ledger" : `the spend ledger is locked by process ${e.owner}`, { cause: e }) : e;
+        }
+        await sleep(wait);
+      }
+    }
   }
 
   /** Whether this client has paid `keys` (a host, a pay-to address) before, by the ledger's own history. */
@@ -124,7 +149,7 @@ export class SpendLedger {
 
   private async locked<T>(fn: (f: LedgerFile) => Promise<{ result: T; write: boolean }>): Promise<T> {
     const run = async () => {
-      const release = await acquireLock(this.lock, (owner) => new Error(owner === undefined ? "could not lock the spend ledger" : `the spend ledger is locked by process ${owner}`));
+      const release = await this.acquire();
       try {
         const f = await this.read();
         const { result, write } = await fn(f);
