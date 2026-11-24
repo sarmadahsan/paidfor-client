@@ -134,6 +134,11 @@ jobs:
           # The section is checked before the tag exists, so a missing one never spends a version: fix it in a
           # new PR, then start Release by hand on main, which tags the tip.
           node .github/scripts/changelog-section.mjs "$VERSION" > /dev/null
+          if [ "$NPM_HAS" = true ]; then
+            # npm already has the version (published by hand before this tag existed): the tag marks the tip of
+            # main, not necessarily the commit the tarball came from, and the release notes say so.
+            echo "backfill=true" >> "$GITHUB_OUTPUT"
+          fi
           echo "Tagging $TAG at $AFTER." | tee -a "$GITHUB_STEP_SUMMARY"
           git tag "$TAG" "$AFTER"
           # A plain push: refused if the tag appeared on the remote meanwhile. A tag is never moved or deleted here.
@@ -145,9 +150,17 @@ jobs:
         if: steps.plan.outputs.action == 'release'
         env:
           VERSION: ${{ steps.state.outputs.version }}
+          TAG: ${{ steps.state.outputs.tag }}
           COMMIT: ${{ steps.plan.outputs.commit }}
         run: |
           set -euo pipefail
+          # Only a commit the owner merged runs here with the job's credentials: the tagged commit must be reachable
+          # from main. A tag pointed elsewhere by hand stops the run before its install scripts execute.
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor "$COMMIT" FETCH_HEAD; then
+            echo "::error::$COMMIT (tag $TAG) is not reachable from main; refusing to build or publish it. Release only commits merged to main."
+            exit 1
+          fi
           git checkout --quiet --detach "$COMMIT"
           at_commit=$(node -p "require('./package.json').version")
           if [ "$at_commit" != "$VERSION" ]; then
@@ -258,9 +271,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.state.outputs.tag }}
+          VERSION: ${{ steps.state.outputs.version }}
           PUBLISH_TAG: ${{ steps.state.outputs.publish_tag }}
+          BACKFILL: ${{ steps.plan.outputs.backfill }}
         run: |
           set -euo pipefail
+          if [ "$BACKFILL" = true ]; then
+            printf '\n\nTag and release created after the fact by the release workflow: npm already served %s@%s when this tag was made, from a publish by hand, so this tag marks the tip of main at that time and does not attest to the commit the npm tarball was built from.\n' "$PACKAGE" "$VERSION" >> "$RUNNER_TEMP/release-notes.md"
+          fi
           latest_flag=()
           if [ "$PUBLISH_TAG" = previous ]; then
             latest_flag=(--latest=false)

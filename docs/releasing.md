@@ -20,8 +20,9 @@ from a terminal, behind npm 2FA) keeps working as the fallback.
    b. Tags `v<version>` at the pushed commit, but only when this push changed the version line of `package.json`
       (`git diff <before> <after> -- package.json`). A push that did not change the version, and finds no tag,
       stops with nothing published. A tag is never moved or deleted by the workflow.
-   c. Checks out the tagged commit, extracts its `CHANGELOG.md` section (a missing section fails here, before
-      anything is published), installs, builds, typechecks and tests.
+   c. Checks that the tagged commit is reachable from `main` (a tag pointed elsewhere by hand stops the run before
+      any of its scripts execute), checks it out, extracts its `CHANGELOG.md` section (a missing section fails
+      here, before anything is published), installs, builds, typechecks and tests.
    d. `npm publish --provenance --access public` through the npm trusted publisher: no token anywhere, no 2FA
       prompt. Skipped when npm already serves the version. A version older than npm `latest` (a retry that a later
       release overtook) is published with `--tag previous`, so `latest` never moves backwards; a prerelease
@@ -33,7 +34,9 @@ from a terminal, behind npm 2FA) keeps working as the fallback.
       that raced the workflow), after reading npm once more right before the write and skipping the move if
       anything changed in between. This needs npm 11.21.0 or 12.2.0 on the runner; with an older npm the step
       fails and prints the one `npm dist-tag add` command to run by hand.
-   g. Creates the GitHub release on the tag with the `CHANGELOG.md` section as its notes. Skipped when it exists.
+   g. Creates the GitHub release on the tag with the `CHANGELOG.md` section as its notes. When the tag was made for
+      a version npm already served (a publish by hand, as 0.8.0 was), the notes say so and that the tag does not
+      attest to the commit the tarball came from. Skipped when the release exists.
 
 Expected time after the merge: five to eight minutes.
 
@@ -91,7 +94,10 @@ failed run, Re-run all jobs). A re-run checks out its original commit.
 - **Two pending runs.** Runs are queued in order (`concurrency` with `queue: max`); a later push with the same
   version in the tree finds the tag and stops. Nothing to do.
 - **npm `latest` is wrong** after a hand publish raced the workflow. Re-run; step f repairs it when the runner's
-  npm allows, and otherwise prints the `npm dist-tag add` command to run by hand with 2FA.
+  npm allows, and otherwise prints the `npm dist-tag add` command to run by hand with 2FA. The rule is always
+  "latest is the newest published release": a `latest` moved back by hand on purpose (a rollback) is moved forward
+  again by the next run that publishes or retries. To roll back for good, deprecate or unpublish the newer version
+  instead of moving the tag.
 - **`CHANGELOG.md` has no section for the version.** CI catches this on the PR. If it reaches `main` anyway, the run
   fails before tagging, so no version is spent: add the section in a new PR, merge, then start Release by hand on
   `main`, which tags the tip. A tag that already exists on a commit without the section (made by hand) is treated
