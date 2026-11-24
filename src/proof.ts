@@ -41,6 +41,15 @@ export type TelemetryOutcome =
 /** Outcomes where nothing was paid. Their rows never carry proof and are counted as refusals, not failures. */
 export const REFUSED_OUTCOMES: ReadonlySet<string> = new Set(["refused_verdict", "refused_ratio", "refused_max_per_call", "refused_authorize", "no_acceptable_quote"]);
 
+/**
+ * Refusals by the buyer's own rules (the 0.8.0 caps and switches). They say nothing about the seller: no row is sent,
+ * and the receipt's `reported_outcome` is null.
+ */
+export const UNREPORTED_REFUSALS: ReadonlySet<string> = new Set(["refused_max_per_day", "refused_max_per_seller_per_day", "refused_max_first_payment", "refused_pay_to", "needs_approval", "frozen"]);
+
+/** Client outcomes a v2 row names as they are. */
+const PASS_THROUGH: ReadonlySet<string> = new Set<TelemetryOutcome>(["refused_verdict", "refused_ratio", "refused_max_per_call", "refused_authorize", "no_acceptable_quote", "paid_no_response", "error"]);
+
 /** The ratio the harness and this client's default use for "over the reference". */
 export const DEFAULT_MAX_RATIO = 1.1;
 
@@ -119,8 +128,9 @@ export interface OutcomeInput {
 export function harnessOutcome(i: OutcomeInput): TelemetryOutcome {
   if (i.outcome !== "ok" && i.outcome !== "validator_failed") {
     // payment_rejected is the harness's not_paid, which a v2 row names `error`. The client sends no row for it, nor for
-    // insufficient_funds (nothing was signed; a wallet that cannot pay says nothing about the seller).
-    return i.outcome === "replayed" || i.outcome === "no_payment_required" || i.outcome === "payment_rejected" || i.outcome === "insufficient_funds" ? "error" : i.outcome;
+    // insufficient_funds (nothing was signed; a wallet that cannot pay says nothing about the seller), nor for the
+    // buyer's own rules (UNREPORTED_REFUSALS), which have no name in the contract.
+    return PASS_THROUGH.has(i.outcome) ? (i.outcome as TelemetryOutcome) : "error";
   }
   const failed = new Set(i.validatorFailures);
   const delivered = i.status !== undefined ? i.status >= 200 && i.status < 300 : !failed.has("http_status");

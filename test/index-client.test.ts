@@ -26,6 +26,18 @@ describe("parseCheck (contract fixtures)", () => {
     const c = parseCheck(fixture("check-partial"), IDX, "https://x.example.com/a?b=1");
     expect(c).toMatchObject({ available: true, verdict: "ok", host: "x.example.com", seller_url: "https://paidfor.dev/seller/x.example.com", listed_price_usdc: null });
   });
+  it("reads the seller's pay-to addresses when the answer carries them, lowercase and once each (0.8.0)", () => {
+    const addr = "0x367F1B3D8CA90D1E087481A9A40D585BF3451A03";
+    const base = fixture("check-caution-listed") as Record<string, unknown>;
+    const seller = base.seller as Record<string, unknown>;
+    expect(parseCheck({ ...base, seller: { ...seller, pay_to_addresses: [addr, addr.toLowerCase(), "nope", 7] } }, IDX, "https://odds.rjhsignaltech.workers.dev/v1/balance").pay_to_addresses).toEqual([addr.toLowerCase()]);
+    expect(parseCheck({ ...base, pay_to_addresses: [addr] }, IDX, "https://odds.rjhsignaltech.workers.dev/v1/balance").pay_to_addresses).toEqual([addr.toLowerCase()]);
+    // Absent, empty or malformed: nothing to compare a quote against.
+    expect(parseCheck(base, IDX, "https://odds.rjhsignaltech.workers.dev/v1/balance").pay_to_addresses).toBeNull();
+    expect(parseCheck({ ...base, seller: { ...seller, pay_to_addresses: [] } }, IDX, "https://odds.rjhsignaltech.workers.dev/v1/balance").pay_to_addresses).toBeNull();
+    expect(parseCheck({ ...base, seller: { ...seller, pay_to_addresses: "0xabc" } }, IDX, "https://odds.rjhsignaltech.workers.dev/v1/balance").pay_to_addresses).toBeNull();
+    expect(parseCheck(fixture("check-unknown"), IDX, "https://never-seen.example.com/api").pay_to_addresses).toBeNull();
+  });
   it("tolerates garbage", () => {
     for (const body of [null, 42, "x", [], { verdict: "great" }]) expect(parseCheck(body, IDX, "https://a.b/c").available).toBe(false);
   });

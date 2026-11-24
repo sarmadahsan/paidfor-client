@@ -1,6 +1,8 @@
 export { safeFetch, hashRequest, type SafeFetch, type SafeFetchOptions, type SafeResponse, type CallOptions, type WalletLike, type SafeNetwork, type AuthorizeRequest, type AuthorizeAnswer } from "./safe-fetch.js";
-export { SafeFetchError, PaymentRefusedError, InsufficientFundsError, IntentConflictError, IntentIndeterminateError, TeamRefusedError, type SafeFetchErrorCode } from "./errors.js";
-export type { Receipt, Outcome, ReceiptWarning } from "./receipt.js";
+export { SafeFetchError, PaymentRefusedError, InsufficientFundsError, IntentConflictError, IntentIndeterminateError, TeamRefusedError, type SafeFetchErrorCode, type RefusalCode } from "./errors.js";
+export type { Receipt, Outcome, ReceiptWarning, FormatWarning, PayToWarning } from "./receipt.js";
+export { deriveNonce, NONCE_KEY, type NonceInput } from "./nonce.js";
+export { SpendLedger, utcDay, sellerKey, type LedgerFile, type LedgerCaps, type LedgerRefusal, type LedgerRule, type Reservation, type SellerHistory } from "./ledger.js";
 export { receiptWarnings } from "./receipt.js";
 export { WARNING_REASONS, isFormatWarning, type WarningReason } from "./validators/content_type.js";
 export type { Verdict, IndexCheck } from "./index-client.js";

@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.8.0
+
+Controls before the signature, every one asked for by name during launch week (Argus Agent Test Lab on x402 issue 3866;
+Zambo, Bloqarl and Nightshift on x402 issue 4367). The scope is
+[sarmadahsan/paidfor-index#74](https://github.com/sarmadahsan/paidfor-index/issues/74), "Client release 0.8.0". All
+seven run after the seller verdict and the price check and before anything is signed, so a payment that is allowed
+behaves exactly as in 0.7.2. None of the new options is required. Each refusal is a `PaymentRefusedError` whose `code`
+and receipt `outcome` name the rule, sends no row to the index (a buyer's own rule says nothing about the seller) and
+leaves `reported_outcome` null. See "Caps and switches" in the README.
+
+1. **Local per-day cap.** `maxPerDayUsd` caps what this client pays per UTC day across every seller; the quote that
+   would take the day over it is refused with `refused_max_per_day`. The totals live in a new spend ledger,
+   `<receiptsDir>/spend.json`, written under a lock like the intent files, so processes sharing the directory share the
+   cap. The amount is reserved before signing and settled once the outcome is known: paid calls, a payment signed and
+   sent with no answer, and a payment the seller rejected (its authorization can still settle until its deadline) stay
+   counted with the amount signed; replays, refusals and free resources never count. When the checks before signing
+   waited across UTC midnight, the reservation moves to the new day and the caps are checked there before the signature.
+   In team mode the cap applies as well, before the team is asked. The lock code moved to `src/fsutil.ts`
+   (`acquireLock`): the lock file is now created by hard link with its content complete, a stale lock is claimed by
+   rename before it is removed, and release removes only the lock this acquisition took; the intent store uses it too,
+   and its in-flight guard is now shared by every store in the process. The ledger waits up to two seconds for another
+   live process to let go of its lock, and never replaces a `spend.json` it cannot read as a version 1 ledger. The
+   receipts directory needs hard links and one host and pid namespace (README, "Receipts directory").
+2. **Pay-to check.** When the index's `/check` answer carries the seller's `pay_to_addresses` (as `/v1/sellers` and
+   `/v1/seller/{domain}` already do) and the quote's `pay_to` is not among them, the receipt gets a warning
+   `unknown_pay_to` (`pay_to`, `known_pay_to`, `message`) and the v2 row carries the code in `warnings`; the call pays.
+   `refuseUnknownPayTo` (default false) refuses instead with `refused_pay_to`. A seller the index does not know, or
+   knows without an address on record, gets neither. `IndexCheck` gains `pay_to_addresses`; `ReceiptWarning` is now
+   `FormatWarning | PayToWarning`. Not done here: the live `/v1/check` answer does not carry `pay_to_addresses` yet
+   (only `/v1/sellers` and `/v1/seller/{domain}` do), so the check is live once the index adds the field to
+   `lib/check.ts`; until then no warning is raised. The client makes no second request for it.
+3. **Deterministic nonce from the intent.** The EIP-3009 nonce is
+   `HMAC-SHA256("x402-safe-fetch:eip3009-nonce:v1", JSON.stringify([intentId, payer, payTo, amountAtomic]))` (payer and
+   pay-to lowercase; `deriveNonce` and `NONCE_KEY` are exported), so a retry of the same purchase from a client whose
+   receipts directory is gone signs the same nonce and the USDC contract rejects the second settlement with
+   `AuthorizationUsed`. The intent store's `signed` phase guard stays as the first line. An approval's nonce (`authorize`,
+   team) and a rejected payment's nonce signed again take precedence, as before. The official `@x402/fetch` signer does not
+   take a nonce, so, as the `authorize` path already did, the client wraps the signer and sets the nonce on the typed data
+   and on the signed payload; the SDK's random nonce is never used.
+4. **Per-seller budget.** `maxPerSellerPerDayUsd` caps one seller's total per UTC day in the same ledger, keyed by the
+   quote's pay-to address in lowercase (the host when the quote names none). Refuses with `refused_max_per_seller_per_day`.
+5. **Approval threshold.** `approveAbove` (USD): above it the call is refused with `needs_approval` instead of paying,
+   and the message names the intent id. New per-call option `approved: true` lifts the threshold for that call once a
+   person has agreed; every other check still applies. Together with `team` (or `PAIDFOR_TEAM_KEY`) it throws when the
+   client is made: the team's account holds the approval rules there.
+6. **Freeze switch.** `frozen: true`, or a file named `frozen` in the receipts directory, refuses every payment with
+   `frozen` until cleared (make the client again without the option; remove the file). Checked before the other
+   checks and again right before the signature. Free resources and replays are not payments and still go through; a
+   frozen client does not wait for the index.
+7. **Stranger cap.** `maxFirstPaymentUsd`: a lower cap on the first payment to a seller the index has no listing for
+   (unknown, unreachable, or `indexUrl: false`) and this client has never paid (no entry in the spend ledger, no price for
+   its origin in `prices.json`). Refuses with `refused_max_first_payment`. `PriceBook` gains `hasOrigin`.
+
+Also: `RefusalCode` is exported; `Outcome` gains the six codes; `SpendLedger`, `utcDay` and `sellerKey` are exported for
+tooling that reads the ledger; the README no longer promises what it did not deliver ("no daily or per-seller budget").
+Telemetry `client` is `x402-safe-fetch/0.8.0`.
+
 ## 0.7.2
 
 Fixes from the launch-gate run of 2026-11-19 (paidfor-index `docs/e2e-issues.md`, issues 56 to 59 and 63).

@@ -21,6 +21,12 @@ export interface IndexCheck {
   evidence_url: string | null;
   /** Listed price for this exact resource, USDC decimal string, when the index has one. */
   listed_price_usdc: string | null;
+  /**
+   * The seller's pay-to addresses the index has seen it settle to (`pay_to_addresses`, lowercase), when the answer
+   * carries them and names at least one; null when it does not (0.8.0). Read from `seller.pay_to_addresses` or the
+   * top level.
+   */
+  pay_to_addresses: string[] | null;
 }
 
 const VERDICTS: readonly Verdict[] = ["avoid", "caution", "ok", "unknown"];
@@ -28,6 +34,13 @@ const VERDICTS: readonly Verdict[] = ["avoid", "caution", "ok", "unknown"];
 export const UNKNOWN_SELLER_NOTE = "verdict unknown";
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v : null);
 const obj = (v: unknown): Record<string, unknown> | null => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+/** `pay_to_addresses` as the index sends it: an array of addresses, lowercased and deduplicated; null when absent or empty. */
+export function parsePayTo(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out = [...new Set(v.filter((a): a is string => typeof a === "string" && ADDRESS_RE.test(a)).map((a) => a.toLowerCase()))];
+  return out.length ? out : null;
+}
 
 /** Seller page on the site that hosts the index: https://paidfor.dev/v1 -> https://paidfor.dev/seller/<host>. */
 export function sellerPageUrl(indexUrl: string, host: string): string {
@@ -62,6 +75,7 @@ export function parseCheck(body: unknown, indexUrl: string, resourceUrl: string)
     seller_url: str(b.seller_url) ?? str(seller?.url) ?? (host ? sellerPageUrl(indexUrl, host) : null),
     evidence_url: str(b.evidence_url) ?? str(seller?.evidence_url),
     listed_price_usdc: str(resource?.listed_price_usdc),
+    pay_to_addresses: parsePayTo(seller?.pay_to_addresses) ?? parsePayTo(b.pay_to_addresses),
   };
   if (verdict === "unknown") out.note = rawVerdict ? UNKNOWN_SELLER_NOTE : "no verdict in response";
   return out;
@@ -81,7 +95,7 @@ export async function checkIndex(indexUrl: string, resourceUrl: string, o: Check
     } catch {
       /* ignore */
     }
-    return { available: false, note, host, verdict: "unknown", verdict_text: null, seller_url: host ? sellerPageUrl(indexUrl, host) : null, evidence_url: null, listed_price_usdc: null };
+    return { available: false, note, host, verdict: "unknown", verdict_text: null, seller_url: host ? sellerPageUrl(indexUrl, host) : null, evidence_url: null, listed_price_usdc: null, pay_to_addresses: null };
   };
   const timeoutMs = o.timeoutMs ?? 2000;
   try {

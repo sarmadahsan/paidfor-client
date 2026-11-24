@@ -17,10 +17,10 @@
  *   unpaid / refused / failed_unpaid                          -> a retry may proceed (nothing was signed)
  */
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { IntentConflictError, IntentIndeterminateError, SafeFetchError } from "./errors.js";
-import { writeJsonDurable } from "./fsutil.js";
+import { acquireLock, writeJsonDurable } from "./fsutil.js";
 
 export type IntentPhase = "reserved" | "signing" | "signed" | "completed" | "unpaid" | "refused" | "failed_unpaid" | "rejected";
 
@@ -78,20 +78,16 @@ export interface IntentLease {
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+/** Intents in flight in this process, by directory and id: shared by every store, since the file lock treats this pid as stale. */
+const inFlight = new Set<string>();
 
 export class IntentStore {
   private readonly dir: string;
-  private readonly held = new Set<string>();
   constructor(receiptsDir: string) {
     this.dir = join(receiptsDir, "intents");
+  }
+  private key(intentId: string): string {
+    return `${this.dir}\0${intentId}`;
   }
 
   private paths(intentId: string) {
@@ -99,42 +95,38 @@ export class IntentStore {
     return { file: `${base}.json`, lock: `${base}.lock` };
   }
 
-  private async lock(intentId: string, lockFile: string): Promise<void> {
+  /** The in-process guard, then the file lock. Returns the function that releases both. */
+  private async lock(intentId: string, lockFile: string): Promise<() => Promise<void>> {
     // Claim in-process synchronously, before any await, so two concurrent calls here cannot both get past this line.
-    if (this.held.has(intentId)) throw new SafeFetchError("intent_in_flight", `intent ${intentId} is already in flight in this process`);
-    this.held.add(intentId);
+    const key = this.key(intentId);
+    if (inFlight.has(key)) throw new SafeFetchError("intent_in_flight", `intent ${intentId} is already in flight in this process`);
+    inFlight.add(key);
+    let unlock: () => Promise<void>;
     try {
-      await this.lockFile(intentId, lockFile);
+      unlock = await this.lockFile(intentId, lockFile);
     } catch (e) {
-      this.held.delete(intentId);
+      inFlight.delete(key);
       throw e;
     }
+    return async () => {
+      // The file lock goes first: until it is gone, a second call in this process must still see the intent in flight.
+      try {
+        await unlock();
+      } finally {
+        inFlight.delete(key);
+      }
+    };
   }
 
-  /** Cross-process lock. A lock file left by a dead process, or by this pid (only possible after a crash), is stale. */
-  private async lockFile(intentId: string, lockFile: string): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const fh = await open(lockFile, "wx");
-        await fh.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }));
-        await fh.close();
-        return;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-        let owner: number | undefined;
-        try {
-          owner = (JSON.parse(await readFile(lockFile, "utf8")) as { pid?: number }).pid;
-        } catch {
-          /* half-written lock: treat as stale */
-        }
-        if (owner !== undefined && owner !== process.pid && pidAlive(owner)) {
-          throw new SafeFetchError("intent_in_flight", `intent ${intentId} is in flight in process ${owner}`);
-        }
-        await unlink(lockFile).catch(() => undefined); // stale lock from a dead process (or ourselves after a crash)
-      }
-    }
-    throw new SafeFetchError("intent_in_flight", `could not lock intent ${intentId}`);
+  /** Cross-process lock (fsutil acquireLock): a lock file left by a dead process, or by this pid after a crash, is stale. */
+  private async lockFile(intentId: string, lockFile: string): Promise<() => Promise<void>> {
+    return acquireLock(lockFile, (owner) =>
+      owner === undefined
+        ? new SafeFetchError("intent_in_flight", `could not lock intent ${intentId}`)
+        : new SafeFetchError("intent_in_flight", `intent ${intentId} is in flight in process ${owner}`),
+    ).catch((e: unknown) => {
+      throw e instanceof SafeFetchError ? e : new SafeFetchError("intent_in_flight", `could not lock intent ${intentId}: ${e instanceof Error ? e.message : String(e)}`, undefined, { cause: e });
+    });
   }
 
   async read(intentId: string): Promise<IntentRecord | undefined> {
@@ -155,11 +147,7 @@ export class IntentStore {
       throw new TypeError("intentId must be a non-empty string of at most 256 characters");
     }
     const { file, lock } = this.paths(intentId);
-    await this.lock(intentId, lock);
-    const release = async () => {
-      this.held.delete(intentId);
-      await unlink(lock).catch(() => undefined);
-    };
+    const release = await this.lock(intentId, lock);
     try {
       const prior = await this.read(intentId);
       if (prior && prior.request_hash !== requestHash) {

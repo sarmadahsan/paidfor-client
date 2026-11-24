@@ -89,6 +89,14 @@ export class PriceBook {
     const e = (await this.load())[key];
     return e && isAtomic(e.amount_atomic) ? BigInt(e.amount_atomic) : undefined;
   }
+  /** Whether any resource on `origin` has a recorded price, that is, this client has paid that seller before (0.8.0). */
+  async hasOrigin(origin: string): Promise<boolean> {
+    const o = origin.toLowerCase();
+    return Object.keys(await this.load()).some((k) => {
+      const url = k.slice(k.indexOf(" ") + 1).toLowerCase();
+      return url === o || url.startsWith(`${o}/`);
+    });
+  }
   async set(key: string, amount: bigint, now = new Date()): Promise<void> {
     const all = await this.load();
     all[key] = { amount_atomic: amount.toString(), at: now.toISOString() };
