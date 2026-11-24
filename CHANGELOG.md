@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Releases from CI.** `.github/workflows/release.yml` runs on every push to `main` (and by hand from the Actions
+  tab): it tags `v<version>` when the push changed the version line of `package.json`, publishes through the npm
+  trusted publisher with provenance (OIDC, no token), waits until npm serves the version, repairs npm `latest` if a
+  hand publish raced it, and creates a GitHub release whose notes are the matching section of this file. Every step
+  checks first whether it already holds, so a re-run finishes a half-done release. `.github/workflows/ci.yml` runs
+  install, build, typecheck and test on every pull request and checks that this file has a section for the version
+  in `package.json`. `package.json` gains `repository` (trusted publishing requires it to match) and `publishConfig`
+  (`access: public`, `provenance: true`). The owner's one-time npm setup and what to do when a run fails are in
+  `docs/releasing.md`. Nothing in the library changed.
+
 ## 0.8.0
 
 Controls before the signature, every one asked for by name during launch week (Argus Agent Test Lab on x402 issue 3866;

@@ -6,6 +6,7 @@
   "license": "MIT",
   "author": "Sarmad Siddiki",
   "homepage": "https://paidfor.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/sarmadahsan/paidfor-client.git" },
   "keywords": ["x402", "fetch", "payments", "usdc", "base", "idempotency", "agents"],
   "engines": { "node": ">=20.3" },
   "exports": {
@@ -16,6 +17,7 @@
   "types": "./dist/index.d.ts",
   "files": ["dist", "README.md", "CHANGELOG.md", "LICENSE", "docs", "examples"],
   "sideEffects": false,
+  "publishConfig": { "access": "public", "provenance": true },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -1,0 +1,37 @@
+# Checks on every pull request and on every push to main. Rollout step 2 of the release automation design
+# (paidfor-index, docs/strategy/design/2026-11-24-release-automation.md): no secrets, nothing published.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        # No version input: the action reads packageManager from package.json (pnpm 10.34.8).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Build first: the examples import the package by name and resolve its types from dist, so typecheck needs
+      # the build output. Same order as the package's prepublishOnly script.
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: CHANGELOG.md has a section for package.json's version (the release workflow uses it as release notes)
+        run: node .github/scripts/changelog-section.mjs "$(node -p "require('./package.json').version")" > /dev/null
