@@ -1,0 +1,244 @@
+# Releases @paidfor/x402-safe-fetch from main. Rollout step 2 of the release automation design in paidfor-index
+# (docs/strategy/design/2026-11-24-release-automation.md). One PR carries the version and its CHANGELOG.md section;
+# the owner's merge is the release decision; this workflow tags v<version>, publishes through the npm trusted
+# publisher (OIDC, no token, no 2FA prompt) and creates the GitHub release. Every step first checks whether it
+# already holds, so a re-run or a workflow_dispatch finishes a half-done release instead of repeating one.
+# How to use it and what to do when a run fails: docs/releasing.md.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  # No inputs: a dispatch runs from the tip of the branch it is started on, and the release environment admits
+  # main only. It finishes a release whose tag exists from the tag's commit, and tags the tip itself when the tree's
+  # version has no tag yet (a lost run, or a version published by hand before this workflow existed).
+  workflow_dispatch:
+
+# contents: write for the tag and the release, id-token: write for the OIDC exchange with npm. Nothing else.
+permissions:
+  contents: write
+  id-token: write
+
+# Runs are serialized and queued in order. Without queue: max GitHub keeps one pending run and a newer push
+# replaces it, which is how a release run would be lost. GitHub rejects queue: max with cancel-in-progress: true.
+concurrency:
+  group: release-client
+  cancel-in-progress: false
+  queue: max
+
+env:
+  PACKAGE: "@paidfor/x402-safe-fetch"
+
+jobs:
+  release:
+    name: Tag, publish, GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The npm trusted publisher is bound to this environment name, and the environment's deployment branch rule
+    # admits main only. npm matches repository, workflow file name and environment name, never the branch, so this
+    # line is what ties every publish to a merge. Never publish from a job without it.
+    environment: release
+    steps:
+      - name: Refuse any ref but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Release runs from refs/heads/main only (got $GITHUB_REF)."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The push's before commit (step b diffs across the push) and a tagged commit (step c) must be reachable.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        # No version input: the action reads packageManager from package.json (pnpm 10.34.8). npm runs the
+        # package's prepublishOnly script, which calls pnpm.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          # No registry-url: it would write an .npmrc that expects NODE_AUTH_TOKEN. Trusted publishing exchanges
+          # the job's OIDC token for a short-lived publish credential; no token is set anywhere in this workflow.
+
+      - name: a. What already holds (version, npm floor, tag, npm, GitHub release, latest)
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/release-state.mjs
+
+      - name: a. Fail when the runner's npm is below the trusted publishing floor
+        if: steps.state.outputs.npm_publish_ok != 'true'
+        env:
+          NPM_CLI: ${{ steps.state.outputs.npm_cli }}
+        run: |
+          echo "::error::npm $NPM_CLI is below 11.5.1, the floor for npm trusted publishing. Node 24 from setup-node carried a newer npm when this workflow was written; check the runner image before publishing anything."
+          exit 1
+
+      - name: a. Nothing to do
+        if: steps.state.outputs.all_done == 'true'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+        run: |
+          echo "Tag v$VERSION, the npm version, the GitHub release and npm latest all hold. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: b. Decide which commit to release, and tag it when this run may
+        id: plan
+        if: steps.state.outputs.all_done != 'true'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+          TAG: ${{ steps.state.outputs.tag }}
+          TAG_EXISTS: ${{ steps.state.outputs.tag_exists }}
+          TAG_SHA: ${{ steps.state.outputs.tag_sha }}
+          NPM_HAS: ${{ steps.state.outputs.npm_has }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$TAG_EXISTS" = true ]; then
+            echo "Tag $TAG exists at $TAG_SHA; the release is finished from that commit." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "commit=$TAG_SHA" >> "$GITHUB_OUTPUT"
+            echo "action=release" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag_tip=false
+          case "$EVENT" in
+            push)
+              # Only the push that changed the version line may tag, whatever landed it (merge, squash, rebase).
+              if ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                git fetch --no-tags origin "$BEFORE" 2>/dev/null || true
+              fi
+              if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                escaped=$(printf '%s' "$VERSION" | sed 's/[.]/\\./g')
+                if git diff "$BEFORE" "$AFTER" -- package.json | grep -Eq "^\+[[:space:]]*\"version\":[[:space:]]*\"$escaped\""; then
+                  echo "This push ($BEFORE..$AFTER) changed package.json's version to $VERSION."
+                  tag_tip=true
+                fi
+              else
+                echo "::warning::The push's before commit $BEFORE is not reachable; the push is treated as one with no version change."
+              fi
+              ;;
+            workflow_dispatch)
+              echo "workflow_dispatch and no tag $TAG yet: the tip of main ($AFTER) is tagged."
+              tag_tip=true
+              ;;
+          esac
+          if [ "$tag_tip" != true ]; then
+            if [ "$NPM_HAS" = true ]; then
+              echo "No version change in this push, no tag $TAG, and $VERSION is on npm (published before this workflow existed, or by hand). Nothing to publish; a workflow_dispatch on main would tag the tip and create the GitHub release." | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::$VERSION is on neither npm nor a tag, and this push did not change the version, so the Release run for the push that introduced $VERSION was lost. Re-run that run (Actions, Release, the run for that commit: a re-run checks out its original commit), or, when it is gone, start Release by hand on main (Actions, Release, Run workflow), which tags the tip of main."
+            exit 1
+          fi
+          echo "Tagging $TAG at $AFTER." | tee -a "$GITHUB_STEP_SUMMARY"
+          git tag "$TAG" "$AFTER"
+          # A plain push: refused if the tag appeared on the remote meanwhile. A tag is never moved or deleted here.
+          git push origin "refs/tags/$TAG"
+          echo "commit=$AFTER" >> "$GITHUB_OUTPUT"
+          echo "action=release" >> "$GITHUB_OUTPUT"
+
+      - name: c. Check out the tagged commit
+        if: steps.plan.outputs.action == 'release'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+          COMMIT: ${{ steps.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git checkout --quiet --detach "$COMMIT"
+          at_commit=$(node -p "require('./package.json').version")
+          if [ "$at_commit" != "$VERSION" ]; then
+            echo "::error::package.json at $COMMIT says $at_commit, not $VERSION."
+            exit 1
+          fi
+
+      - name: c. Release notes from CHANGELOG.md (fails here, before anything is published, when the section is missing)
+        if: steps.plan.outputs.action == 'release'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+        run: node .github/scripts/changelog-section.mjs "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: c. Install, build, typecheck, test the tagged commit
+        if: steps.plan.outputs.action == 'release'
+        # Build before typecheck: the examples resolve the package's types from dist. Same order as prepublishOnly.
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm typecheck
+          pnpm test
+
+      - name: d. npm publish through the trusted publisher
+        if: steps.plan.outputs.action == 'release' && steps.state.outputs.npm_has != 'true'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+          # "previous" when a later release overtook this version (a retry), so latest never moves backwards.
+          PUBLISH_TAG: ${{ steps.state.outputs.publish_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NODE_AUTH_TOKEN:-}" ] || [ -n "${NPM_TOKEN:-}" ]; then
+            echo "::error::A registry token is set in the environment. Trusted publishing needs none; refusing to publish."
+            exit 1
+          fi
+          echo "Publishing $PACKAGE@$VERSION with dist-tag $PUBLISH_TAG." | tee -a "$GITHUB_STEP_SUMMARY"
+          # prepublishOnly (pnpm build && pnpm typecheck && pnpm test) runs here as well, as it does for a hand
+          # publish, so the tarball always comes from a tree that just passed the same checks.
+          npm publish --provenance --access public --tag "$PUBLISH_TAG"
+
+      - name: e. Wait until npm serves the version
+        if: steps.plan.outputs.action == 'release' && steps.state.outputs.npm_has != 'true'
+        env:
+          VERSION: ${{ steps.state.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://registry.npmjs.org/${PACKAGE/\//%2F}/$VERSION"
+          for attempt in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = 200 ]; then
+              echo "npm serves $PACKAGE@$VERSION."
+              exit 0
+            fi
+            echo "attempt $attempt: $url answered $code; waiting 10 s"
+            sleep 10
+          done
+          echo "::error::npm did not serve $PACKAGE@$VERSION within five minutes. Re-run this workflow once it does; the run skips what already holds."
+          exit 1
+
+      - name: f. What holds now (npm latest may need a repair)
+        id: after
+        if: steps.plan.outputs.action == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/release-state.mjs
+
+      - name: f. Repair npm latest when it is behind the newest published version
+        if: steps.plan.outputs.action == 'release' && steps.after.outputs.latest_behind == 'true'
+        env:
+          LATEST: ${{ steps.after.outputs.latest }}
+          NEWEST: ${{ steps.after.outputs.newest }}
+          NPM_CLI: ${{ steps.after.outputs.npm_cli }}
+          NPM_DIST_TAG_OK: ${{ steps.after.outputs.npm_dist_tag_ok }}
+        run: |
+          set -euo pipefail
+          if [ "$NPM_DIST_TAG_OK" != true ]; then
+            echo "::error::npm latest is $LATEST but the newest published version is $NEWEST, and npm $NPM_CLI cannot change dist-tags under trusted publishing (needs 11.21.0 or 12.2.0). Repair by hand with 2FA: npm dist-tag add $PACKAGE@$NEWEST latest. Then re-run this workflow to finish the release."
+            exit 1
+          fi
+          echo "Moving npm latest from $LATEST to $NEWEST." | tee -a "$GITHUB_STEP_SUMMARY"
+          npm dist-tag add "$PACKAGE@$NEWEST" latest
+
+      - name: g. GitHub release on the tag with the CHANGELOG.md section as notes
+        if: steps.plan.outputs.action == 'release' && steps.state.outputs.release_exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.state.outputs.tag }}
+          PUBLISH_TAG: ${{ steps.state.outputs.publish_tag }}
+        run: |
+          set -euo pipefail
+          latest_flag=()
+          if [ "$PUBLISH_TAG" = previous ]; then
+            latest_flag=(--latest=false)
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${latest_flag[@]}"
+          echo "GitHub release $TAG created." | tee -a "$GITHUB_STEP_SUMMARY"
