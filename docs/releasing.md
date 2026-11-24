@@ -24,13 +24,15 @@ from a terminal, behind npm 2FA) keeps working as the fallback.
       anything is published), installs, builds, typechecks and tests.
    d. `npm publish --provenance --access public` through the npm trusted publisher: no token anywhere, no 2FA
       prompt. Skipped when npm already serves the version. A version older than npm `latest` (a retry that a later
-      release overtook) is published with `--tag previous`, so `latest` never moves backwards. The package's
+      release overtook) is published with `--tag previous`, so `latest` never moves backwards; a prerelease
+      (`0.9.0-rc.1`) is published with `--tag next` and never takes `latest`. The package's
       `prepublishOnly` script (`pnpm build && pnpm typecheck && pnpm test`) runs as part of the publish, as it does
       for a hand publish.
    e. Waits until `https://registry.npmjs.org/@paidfor/x402-safe-fetch/<version>` answers 200, up to five minutes.
    f. Repairs npm `latest` with `npm dist-tag add` when it is behind the newest published version (a hand publish
-      that raced the workflow). This needs npm 11.21.0 or 12.2.0 on the runner; with an older npm the step fails
-      and prints the one `npm dist-tag add` command to run by hand.
+      that raced the workflow), after reading npm once more right before the write and skipping the move if
+      anything changed in between. This needs npm 11.21.0 or 12.2.0 on the runner; with an older npm the step
+      fails and prints the one `npm dist-tag add` command to run by hand.
    g. Creates the GitHub release on the tag with the `CHANGELOG.md` section as its notes. Skipped when it exists.
 
 Expected time after the merge: five to eight minutes.
@@ -74,7 +76,13 @@ failed run, Re-run all jobs). A re-run checks out its original commit.
   expired (2 days unused), or `npm publish` is not among its allowed actions. Fix it on npmjs.com, re-run. Until it
   is fixed, `pnpm publish` by hand from the tagged commit (`git checkout v<version>`) still works; the next run then
   finds the version on npm and finishes the GitHub release.
-- **A tag exists but npm has no such version.** A publish to retry, never a version to skip. Re-run the run.
+- **A tag exists but npm has no such version.** A publish to retry, never a version to skip. Re-run the run that
+  created the tag (Actions, Release, that run, Re-run all jobs): a re-run keeps its commit, and the workflow
+  publishes only when the tagged commit is the run's own commit, because npm's provenance names the run's commit
+  (`GITHUB_SHA`), not the checked-out tree. A later push or a dispatch from a moved `main` finds the tag, stops
+  before publishing with that message, and still finishes the GitHub release once npm has the version. When the
+  original run is gone, publish by hand from the tag (`git checkout v<version>`, `pnpm publish`) or release the
+  fix as the next version.
 - **The tagged commit fails typecheck, test or build.** The version is spent: nothing was published, and the fix
   goes out as the next patch version in a new release PR. Do not move the tag.
 - **The run says the release run was lost** (the tree's version is on neither npm nor a tag, and the push did not
@@ -85,4 +93,6 @@ failed run, Re-run all jobs). A re-run checks out its original commit.
 - **npm `latest` is wrong** after a hand publish raced the workflow. Re-run; step f repairs it when the runner's
   npm allows, and otherwise prints the `npm dist-tag add` command to run by hand with 2FA.
 - **`CHANGELOG.md` has no section for the version.** CI catches this on the PR. If it reaches `main` anyway, the run
-  fails after tagging and before publishing; add the section in a new PR and re-run.
+  fails before tagging, so no version is spent: add the section in a new PR, merge, then start Release by hand on
+  `main`, which tags the tip. A tag that already exists on a commit without the section (made by hand) is treated
+  like a failed tagged build: the section and the fix go out as the next patch version; the tag stays.

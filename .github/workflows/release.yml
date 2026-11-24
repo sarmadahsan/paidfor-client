@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$TAG_EXISTS" = true ]; then
-            echo "Tag $TAG exists at $TAG_SHA; the release is finished from that commit." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Tag $TAG exists at $TAG_SHA; the release is finished from that commit. A publish happens only when that is this run's own commit ($AFTER); see step d." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "commit=$TAG_SHA" >> "$GITHUB_OUTPUT"
             echo "action=release" >> "$GITHUB_OUTPUT"
             exit 0
@@ -131,6 +131,9 @@ jobs:
             echo "::error::$VERSION is on neither npm nor a tag, and this push did not change the version, so the Release run for the push that introduced $VERSION was lost. Re-run that run (Actions, Release, the run for that commit: a re-run checks out its original commit), or, when it is gone, start Release by hand on main (Actions, Release, Run workflow), which tags the tip of main."
             exit 1
           fi
+          # The section is checked before the tag exists, so a missing one never spends a version: fix it in a
+          # new PR, then start Release by hand on main, which tags the tip.
+          node .github/scripts/changelog-section.mjs "$VERSION" > /dev/null
           echo "Tagging $TAG at $AFTER." | tee -a "$GITHUB_STEP_SUMMARY"
           git tag "$TAG" "$AFTER"
           # A plain push: refused if the tag appeared on the remote meanwhile. A tag is never moved or deleted here.
@@ -172,12 +175,24 @@ jobs:
         if: steps.plan.outputs.action == 'release' && steps.state.outputs.npm_has != 'true'
         env:
           VERSION: ${{ steps.state.outputs.version }}
-          # "previous" when a later release overtook this version (a retry), so latest never moves backwards.
+          # "previous" when a later release overtook this version (a retry), so latest never moves backwards;
+          # "next" for a prerelease, which never takes latest.
           PUBLISH_TAG: ${{ steps.state.outputs.publish_tag }}
+          TAG: ${{ steps.state.outputs.tag }}
         run: |
           set -euo pipefail
           if [ -n "${NODE_AUTH_TOKEN:-}" ] || [ -n "${NPM_TOKEN:-}" ]; then
             echo "::error::A registry token is set in the environment. Trusted publishing needs none; refusing to publish."
+            exit 1
+          fi
+          # npm's provenance names this run's commit (GITHUB_SHA), not the checked-out tree. A tagged commit that
+          # differs from it would get a tarball built from one commit with provenance naming another, and npm never
+          # takes a version twice. So only a run whose own commit is the tagged one publishes: the run of the push
+          # that tagged (or its re-run, which keeps its commit), or a dispatch while the tip of main is still that
+          # commit. Steps f and g still finish a release whose version npm already serves, whatever the commit.
+          head_sha=$(git rev-parse HEAD)
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::The tagged commit $head_sha is not this run's commit $GITHUB_SHA, so publishing here would attach provenance for the wrong commit. Re-run the Release run that created the tag (Actions, Release, that run, Re-run all jobs: it keeps its commit). If that run is gone, publish by hand from the tag (git checkout $TAG; pnpm publish) or release the fix as the next version; never move the tag."
             exit 1
           fi
           echo "Publishing $PACKAGE@$VERSION with dist-tag $PUBLISH_TAG." | tee -a "$GITHUB_STEP_SUMMARY"
@@ -214,6 +229,7 @@ jobs:
       - name: f. Repair npm latest when it is behind the newest published version
         if: steps.plan.outputs.action == 'release' && steps.after.outputs.latest_behind == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           LATEST: ${{ steps.after.outputs.latest }}
           NEWEST: ${{ steps.after.outputs.newest }}
           NPM_CLI: ${{ steps.after.outputs.npm_cli }}
@@ -223,6 +239,16 @@ jobs:
           if [ "$NPM_DIST_TAG_OK" != true ]; then
             echo "::error::npm latest is $LATEST but the newest published version is $NEWEST, and npm $NPM_CLI cannot change dist-tags under trusted publishing (needs 11.21.0 or 12.2.0). Repair by hand with 2FA: npm dist-tag add $PACKAGE@$NEWEST latest. Then re-run this workflow to finish the release."
             exit 1
+          fi
+          # Read npm once more right before writing: a hand publish since step f could have moved latest or added
+          # a newer version, and npm dist-tag add has no conditional form. The move happens only when nothing
+          # changed. The seconds between this read and the write remain a window; a later run repairs again.
+          node .github/scripts/release-state.mjs > "$RUNNER_TEMP/state-now.txt"
+          latest_now=$(sed -n 's/^latest=//p' "$RUNNER_TEMP/state-now.txt")
+          newest_now=$(sed -n 's/^newest=//p' "$RUNNER_TEMP/state-now.txt")
+          if [ "$latest_now" != "$LATEST" ] || [ "$newest_now" != "$NEWEST" ]; then
+            echo "npm changed since the last read (latest $LATEST -> $latest_now, newest $NEWEST -> $newest_now); no repair this run." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo "Moving npm latest from $LATEST to $NEWEST." | tee -a "$GITHUB_STEP_SUMMARY"
           npm dist-tag add "$PACKAGE@$NEWEST" latest
@@ -238,6 +264,8 @@ jobs:
           latest_flag=()
           if [ "$PUBLISH_TAG" = previous ]; then
             latest_flag=(--latest=false)
+          elif [ "$PUBLISH_TAG" = next ]; then
+            latest_flag=(--latest=false --prerelease)
           fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md" "${latest_flag[@]}"

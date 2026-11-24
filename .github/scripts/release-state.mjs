@@ -103,8 +103,9 @@ if (packumentRes.status === 200) {
 // The newest published release; prereleases never count, since "latest" should never point at one.
 const newest = published.filter((v) => !isPrerelease(v)).sort(compare).at(-1) ?? "";
 const latestBehind = newest !== "" && latest !== newest;
-// A version below the newest published release is a retry a later release overtook: publish it under "previous".
-const publishTag = newest !== "" && compare(version, newest) < 0 ? "previous" : "latest";
+// The dist-tag the publish gets. A prerelease goes under "next", never "latest". A release below the newest
+// published release is a retry a later release overtook: "previous", so latest never moves backwards.
+const publishTag = isPrerelease(version) ? "next" : newest !== "" && compare(version, newest) < 0 ? "previous" : "latest";
 
 // The GitHub release for the tag.
 let releaseExists = false;
