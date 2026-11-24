@@ -174,11 +174,15 @@ take the day over it is refused with `refused_max_per_day`; the message says wha
 The day's totals live in `<receiptsDir>/spend.json`, the spend ledger, written under a lock like the intent files, so
 every process that shares the directory (and the wallet) shares the cap. Before signing, the amount is reserved in the
 ledger; once the outcome is known, a paid call stays counted (with the amount signed) and anything else gives the
-reservation back. So replays, refusals, free resources and payments the seller rejected never count; a payment that
-was signed and sent and got no answer does, because the money may have moved; and a reservation whose process died
-before settling stays counted for the rest of the day. Days before yesterday are pruned. The ledger is only written when
-one of `maxPerDayUsd`, `maxPerSellerPerDayUsd` or `maxFirstPaymentUsd` is set. A ledger that cannot be read or written
-stops the payment (`sdk` error, nothing signed).
+reservation back. So replays, refusals and free resources never count. Three things do count although nothing may have
+moved, because the signed authorization could still settle: a payment signed and sent with no answer, a payment the
+seller rejected (`payment_rejected`; its authorization stays usable until `valid_before`, and a retry of it counts
+again, so the day may run ahead of what was paid by that amount), and a reservation whose process died before
+settling, for the rest of the day. The checks before signing can wait on the index, the balance and an approval; the
+caps are checked again right before the signature when that wait crossed UTC midnight, and a reservation is moved to
+the day it signs on. Days before yesterday are pruned. The ledger is only written when one of `maxPerDayUsd`,
+`maxPerSellerPerDayUsd` or `maxFirstPaymentUsd` is set. A ledger that cannot be read or written stops the payment (`sdk`
+error, nothing signed).
 
 In team mode the local caps apply as well, before the team is asked: a payment must pass both, as with
 `maxPerCallUsd`. The team's own budgets are not changed by them.
@@ -224,7 +228,8 @@ Two ways, both refuse every payment with `frozen` until cleared:
 
 - `frozen: true` in the options (default `false`). Clear it by making the client again without it.
 - A file named `frozen` in the receipts directory (`touch .x402-receipts/frozen`), whatever its content. Checked
-  before every payment, so it stops a client that is already running; remove the file to clear it.
+  before every payment and again right before the signature (the checks in between can wait on an approval), so it
+  stops a client that is already running; remove the file to clear it.
 
 Free resources (no 402) and replays of a stored intent are not payments and still go through. A frozen client does not
 wait for the index before refusing.

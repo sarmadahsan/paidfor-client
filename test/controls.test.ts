@@ -87,7 +87,7 @@ describe("maxPerDayUsd: the day's total, across sellers and processes", () => {
     expect(mock.st.paidCount).toBe(1);
   });
 
-  it("replays, refusals, free resources and rejected payments do not count", async () => {
+  it("replays, refusals and free resources do not count", async () => {
     const f = client({ maxPerDayUsd: 0.025, maxPerCallUsd: 0.5 });
     await f(`${mock.base}/a`, {}, { intentId: "r-1" });
     const again = await f(`${mock.base}/a`, {}, { intentId: "r-1" });
@@ -98,16 +98,46 @@ describe("maxPerDayUsd: the day's total, across sellers and processes", () => {
     indexAnswer("check-avoid");
     await expect(f(`${mock.base}/b`)).rejects.toBeInstanceOf(PaymentRefusedError);
     mock.st.index = { kind: "status", status: 503 };
-    mock.st.mode = "reject_402";
-    // A rejected payment takes a reservation and gives it back: nothing settled.
-    const rej = await f(`${mock.base}/c`);
-    expect(rej.receipt.outcome).toBe("payment_rejected");
-    mock.st.mode = "ok";
-    const l = await ledger();
-    expect(l.days[today()]).toMatchObject({ settled_atomic: "10000", pending: {} });
+    // A refusal by another cap takes a reservation and gives it back.
+    mock.st.amount = "600000";
+    await expect(f(`${mock.base}/c`)).rejects.toMatchObject({ code: "refused_max_per_call" });
+    mock.st.amount = "10000";
+    expect((await ledger()).days[today()]).toMatchObject({ settled_atomic: "10000", pending: {} });
     // The room left is one payment of 0.01: the cap is 0.025.
     await f(`${mock.base}/d`);
     await expect(f(`${mock.base}/e`)).rejects.toMatchObject({ code: "refused_max_per_day" });
+  });
+
+  it("a payment the seller rejected stays counted: its authorization can still be settled until its deadline", async () => {
+    mock.st.mode = "reject_402";
+    const f = client({ maxPerDayUsd: 0.015 });
+    const rej = await f(`${mock.base}/c`, {}, { intentId: "rej" });
+    expect(rej.receipt.outcome).toBe("payment_rejected");
+    expect((await ledger()).days[today()]).toMatchObject({ settled_atomic: "10000", pending: {} });
+    mock.st.mode = "ok";
+    // A new intent would be a second authorization that could also settle: the cap holds it.
+    await expect(f(`${mock.base}/d`)).rejects.toMatchObject({ code: "refused_max_per_day" });
+  });
+
+  it("the freeze marker is checked again right before signing, after the approval was waited for", async () => {
+    const f = client({
+      authorize: async () => {
+        await writeFile(join(dir, "frozen"), "");
+        return { approve: true, nonce: `0x${"7a".repeat(32)}`, validBefore: Math.floor(Date.now() / 1000) + 120 };
+      },
+    });
+    const err = await refused(f(`${mock.base}/a`));
+    expect(err.code).toBe("frozen");
+    expect(mock.st.paidCount).toBe(0);
+  });
+
+  it("two clients in one process sharing the directory line up on the ledger", async () => {
+    const a = client({ maxPerDayUsd: 0.015 });
+    const b = client({ maxPerDayUsd: 0.015 });
+    const results = await Promise.allSettled([a(`${mock.base}/a`), b(`${mock.base}/b`)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toMatchObject({ code: "refused_max_per_day" });
+    expect(mock.st.paidCount).toBe(1);
   });
 
   it("a payment signed and sent with no response counts, since the money may have moved", async () => {

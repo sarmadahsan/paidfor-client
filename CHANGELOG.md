@@ -12,11 +12,15 @@ leaves `reported_outcome` null. See "Caps and switches" in the README.
 
 1. **Local per-day cap.** `maxPerDayUsd` caps what this client pays per UTC day across every seller; the quote that
    would take the day over it is refused with `refused_max_per_day`. The totals live in a new spend ledger,
-   `<receiptsDir>/spend.json`, written under a lock like the intent files (the lock code moved to `src/fsutil.ts`,
-   `acquireLock`, and the intent store uses it too), so processes sharing the directory share the cap. The amount is
-   reserved before signing and settled once the outcome is known: paid calls (and a payment signed and sent with no
-   answer) stay counted with the amount signed; replays, refusals, free resources and rejected payments never count. In
-   team mode the cap applies as well, before the team is asked.
+   `<receiptsDir>/spend.json`, written under a lock like the intent files, so processes sharing the directory share the
+   cap. The amount is reserved before signing and settled once the outcome is known: paid calls, a payment signed and
+   sent with no answer, and a payment the seller rejected (its authorization can still settle until its deadline) stay
+   counted with the amount signed; replays, refusals and free resources never count. When the checks before signing
+   waited across UTC midnight, the reservation moves to the new day and the caps are checked there before the signature.
+   In team mode the cap applies as well, before the team is asked. The lock code moved to `src/fsutil.ts`
+   (`acquireLock`): the lock file is now created by hard link with its content complete, a stale lock is claimed by
+   rename before it is removed, and release removes only the lock this acquisition took; the intent store uses it too,
+   and its in-flight guard is now shared by every store in the process.
 2. **Pay-to check.** When the index's `/check` answer carries the seller's `pay_to_addresses` (as `/v1/sellers` and
    `/v1/seller/{domain}` already do) and the quote's `pay_to` is not among them, the receipt gets a warning
    `unknown_pay_to` (`pay_to`, `known_pay_to`, `message`) and the v2 row carries the code in `warnings`; the call pays.
@@ -40,8 +44,9 @@ leaves `reported_outcome` null. See "Caps and switches" in the README.
    person has agreed; every other check still applies. Together with `team` (or `PAIDFOR_TEAM_KEY`) it throws when the
    client is made: the team's account holds the approval rules there.
 6. **Freeze switch.** `frozen: true`, or a file named `frozen` in the receipts directory, refuses every payment with
-   `frozen` until cleared (make the client again without the option; remove the file). Free resources and replays are
-   not payments and still go through; a frozen client does not wait for the index.
+   `frozen` until cleared (make the client again without the option; remove the file). Checked before the other
+   checks and again right before the signature. Free resources and replays are not payments and still go through; a
+   frozen client does not wait for the index.
 7. **Stranger cap.** `maxFirstPaymentUsd`: a lower cap on the first payment to a seller the index has no listing for
    (unknown, unreachable, or `indexUrl: false`) and this client has never paid (no entry in the spend ledger, no price for
    its origin in `prices.json`). Refuses with `refused_max_first_payment`. `PriceBook` gains `hasOrigin`.

@@ -5,9 +5,10 @@
  * share one wallet and one directory.
  *
  * A payment is reserved before anything is signed and settled once its outcome is known: a paid outcome (money moved,
- * or may have) is added to the day, anything else (a refusal, a rejected payment, a free resource) is dropped. A
- * reservation whose process died before settling stays counted for the day: it may have signed. Replays never reach
- * the ledger. Days before yesterday (UTC) are pruned on every write; the seller history is kept.
+ * or may have: a payment sent with no answer, or one the seller rejected but could still settle until its deadline) is
+ * added to the day, anything else (a refusal, a free resource) is dropped. A reservation whose process died before
+ * settling stays counted for the day: it may have signed. Replays never reach the ledger. Days before yesterday (UTC)
+ * are pruned on every write; the seller history is kept.
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -86,11 +87,15 @@ export function sellerKey(payTo: string | undefined, host: string): string {
   return typeof payTo === "string" && /^0x[0-9a-fA-F]{40}$/.test(payTo) ? payTo.toLowerCase() : host.toLowerCase();
 }
 
+/**
+ * In-process queues, one per ledger file: the file lock treats this pid as stale, so every call in this process on one
+ * file lines up here, whichever SpendLedger instance (whichever safeFetch client) made it.
+ */
+const queues = new Map<string, Promise<unknown>>();
+
 export class SpendLedger {
   readonly file: string;
   private readonly lock: string;
-  /** In-process queue: the file lock treats this pid as stale, so concurrent calls in one process line up here. */
-  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(dir: string) {
     this.file = join(dir, "spend.json");
@@ -129,9 +134,24 @@ export class SpendLedger {
         await release();
       }
     };
-    const p = this.chain.then(run, run);
-    this.chain = p.catch(() => undefined);
+    const prev = queues.get(this.file) ?? Promise.resolve();
+    const p = prev.then(run, run);
+    queues.set(this.file, p.catch(() => undefined));
     return p;
+  }
+
+  /** The cap a quote of `amount` to `seller` would break on `row`'s day, or undefined when it fits. */
+  private room(row: DayRow, seller: string, amount: bigint, caps: LedgerCaps): LedgerRefusal | undefined {
+    const pending = Object.values(row.pending);
+    if (caps.perSellerPerDay !== undefined) {
+      const spent = atomic(row.by_seller[seller]) + pending.filter((p) => p.seller === seller).reduce((a, p) => a + atomic(p.amount_atomic), 0n);
+      if (spent + amount > caps.perSellerPerDay) return { rule: "per_seller_per_day", spent, cap: caps.perSellerPerDay, amount, seller };
+    }
+    if (caps.perDay !== undefined) {
+      const spent = atomic(row.settled_atomic) + pending.reduce((a, p) => a + atomic(p.amount_atomic), 0n);
+      if (spent + amount > caps.perDay) return { rule: "per_day", spent, cap: caps.perDay, amount, seller };
+    }
+    return undefined;
   }
 
   /** Drop days before yesterday (UTC): a cap spans one day, and yesterday is kept for a clock near midnight. */
@@ -154,22 +174,36 @@ export class SpendLedger {
     return this.locked<Outcome>(async (f) => {
       this.prune(f, day);
       const row = (f.days[day] ??= emptyDay());
-      const pending = Object.values(row.pending);
       const refuse = (refusal: LedgerRefusal): { result: Outcome; write: boolean } => ({ result: { ok: false, refusal }, write: false });
       if (i.caps.firstPayment !== undefined && i.unlisted && !i.known && f.sellers[seller] === undefined && f.sellers[host] === undefined && i.amount > i.caps.firstPayment) {
         return refuse({ rule: "first_payment", spent: 0n, cap: i.caps.firstPayment, amount: i.amount, seller });
       }
-      if (i.caps.perSellerPerDay !== undefined) {
-        const spent = atomic(row.by_seller[seller]) + pending.filter((p) => p.seller === seller).reduce((a, p) => a + atomic(p.amount_atomic), 0n);
-        if (spent + i.amount > i.caps.perSellerPerDay) return refuse({ rule: "per_seller_per_day", spent, cap: i.caps.perSellerPerDay, amount: i.amount, seller });
-      }
-      if (i.caps.perDay !== undefined) {
-        const spent = atomic(row.settled_atomic) + pending.reduce((a, p) => a + atomic(p.amount_atomic), 0n);
-        if (spent + i.amount > i.caps.perDay) return refuse({ rule: "per_day", spent, cap: i.caps.perDay, amount: i.amount, seller });
-      }
+      const over = this.room(row, seller, i.amount, i.caps);
+      if (over) return refuse(over);
       const id = randomBytes(8).toString("hex");
       row.pending[id] = { amount_atomic: i.amount.toString(), seller, pid: process.pid, at: now.toISOString() };
       return { result: { ok: true, reservation: { id, day, seller, host, amount: i.amount } }, write: true };
+    });
+  }
+
+  /**
+   * Move a reservation to the current UTC day when the day has changed since it was made (the checks before signing may
+   * have waited across midnight), rechecking the day caps there. Unchanged when the day is the same. When the payment no
+   * longer fits, the reservation is removed and the refusal returned: the caller holds nothing any more.
+   */
+  async rollover(res: Reservation, caps: LedgerCaps, now = new Date()): Promise<{ ok: true; reservation: Reservation } | { ok: false; refusal: LedgerRefusal }> {
+    const day = utcDay(now);
+    if (day === res.day) return { ok: true, reservation: res };
+    type Outcome = { ok: true; reservation: Reservation } | { ok: false; refusal: LedgerRefusal };
+    return this.locked<Outcome>(async (f) => {
+      const old = f.days[res.day];
+      if (old) delete old.pending[res.id];
+      this.prune(f, day);
+      const row = (f.days[day] ??= emptyDay());
+      const over = this.room(row, res.seller, res.amount, caps);
+      if (over) return { result: { ok: false, refusal: over }, write: true };
+      row.pending[res.id] = { amount_atomic: res.amount.toString(), seller: res.seller, pid: process.pid, at: now.toISOString() };
+      return { result: { ok: true, reservation: { ...res, day } }, write: true };
     });
   }
 

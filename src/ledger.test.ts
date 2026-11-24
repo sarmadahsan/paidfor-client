@@ -91,11 +91,38 @@ describe("SpendLedger", () => {
     expect(await l.hasPaid("nobody.example.com")).toBe(false);
   });
 
-  it("calls in one process line up: two at once never both fit in the last room", async () => {
+  it("calls in one process line up, across instances on the same file: two at once never both fit in the last room", async () => {
     const l = new SpendLedger(dir);
+    const other = new SpendLedger(dir);
     const caps = { perDay: 10_000n };
-    const both = await Promise.all([l.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true }), l.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true })]);
+    const both = await Promise.all([l.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true }), other.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true })]);
     expect(both.filter((r) => r.ok)).toHaveLength(1);
+    const four = await Promise.all([1, 2, 3, 4].map(() => new SpendLedger(dir).reserve({ seller: PAY_TO, host: HOST, amount: 1n, caps: { perDay: 20_000n }, unlisted: false, known: true })));
+    expect(four.every((r) => r.ok)).toBe(true);
+    expect(Object.keys((await file()).days[utcDay(new Date())]!.pending)).toHaveLength(5);
+  });
+
+  it("rollover moves a reservation made before UTC midnight to the new day and rechecks the caps there", async () => {
+    const l = new SpendLedger(dir);
+    const caps = { perDay: 15_000n };
+    const before = at("2026-11-23T23:59:59Z");
+    const after = at("2026-11-24T00:00:01Z");
+    const r = okRes(await l.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true, now: before }));
+    expect(await l.rollover(r, caps, before)).toEqual({ ok: true, reservation: r });
+    const moved = await l.rollover(r, caps, after);
+    expect(moved).toEqual({ ok: true, reservation: { ...r, day: "2026-11-24" } });
+    let f = await file();
+    expect(f.days["2026-11-23"]!.pending).toEqual({});
+    expect(Object.keys(f.days["2026-11-24"]!.pending)).toEqual([r.id]);
+    // Settled, it is charged to the day it signed on.
+    await l.settle(moved.ok ? moved.reservation : r, true, 10_000n, after);
+    f = await file();
+    expect(f.days["2026-11-24"]).toMatchObject({ settled_atomic: "10000", pending: {} });
+    expect(f.days["2026-11-23"]).toMatchObject({ settled_atomic: "0" });
+    // A reservation that no longer fits the new day is removed, and the refusal names the day's spend.
+    const r2 = okRes(await l.reserve({ seller: PAY_TO, host: HOST, amount: 10_000n, caps, unlisted: false, known: true, now: at("2026-11-23T23:59:59Z") }));
+    expect(await l.rollover(r2, caps, after)).toEqual({ ok: false, refusal: { rule: "per_day", spent: 10_000n, cap: 15_000n, amount: 10_000n, seller: PAY_TO } });
+    expect((await file()).days["2026-11-23"]!.pending).toEqual({});
   });
 
   it("a lock held by another live process fails the call; a lock from a dead process is stale", async () => {

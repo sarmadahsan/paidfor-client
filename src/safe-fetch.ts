@@ -19,7 +19,7 @@ import { readBodyTee } from "./body.js";
 import { InsufficientFundsError, IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type RefusalCode, type SafeFetchErrorCode } from "./errors.js";
 import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
-import { SpendLedger, sellerKey, type LedgerCaps, type Reservation } from "./ledger.js";
+import { SpendLedger, sellerKey, utcDay, type LedgerCaps, type LedgerRefusal, type Reservation } from "./ledger.js";
 import { deriveNonce } from "./nonce.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
 import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, UNREPORTED_REFUSALS, buildProof, failureLabels, harnessOutcome } from "./proof.js";
@@ -719,11 +719,12 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     try {
       return await attempt(lease, req, r, t0, authorize, call, ctl);
     } finally {
-      // The day's totals: a paid outcome (money moved, or may have: paid_no_response after sending) is counted with the
-      // amount signed; anything else gives the reservation back.
+      // The day's totals: a paid outcome (money moved, or may have: paid_no_response after sending, and a payment the
+      // seller rejected, whose authorization can still be settled until its deadline) is counted with the amount signed;
+      // anything else gives the reservation back.
       if (ctl.reservation && ledger) {
         await ledger
-          .settle(ctl.reservation, r.paid, ctl.signedAtomic ?? ctl.reservation.amount)
+          .settle(ctl.reservation, r.paid || r.outcome === "payment_rejected", ctl.signedAtomic ?? ctl.reservation.amount)
           .catch((e: unknown) => warn(`the spend ledger could not be updated for intent ${r.intent_id} (${errMsg(e)}); its reservation stays counted for today`));
       }
     }
@@ -824,13 +825,14 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       const host = r.seller.host ?? "the seller";
       const hostname = new URL(req.url).hostname.toLowerCase();
 
+      const frozenRefusal = (): NonNullable<typeof refusal> => ({
+        code: "frozen",
+        message: `refused to pay ${usd} for ${req.url}: payments are frozen (${frozenOpt ? "frozen: true" : `the file ${frozenMarker} exists`}). ${frozenOpt ? "Make the client again without frozen" : "Remove that file"} to clear it.`,
+        sellerUrl: null,
+      });
       // 0. The freeze switch (0.8.0): the option, or a marker file in the receipts directory, refuses every payment.
       if (await isFrozen()) {
-        refusal = {
-          code: "frozen",
-          message: `refused to pay ${usd} for ${req.url}: payments are frozen (${frozenOpt ? "frozen: true" : `the file ${frozenMarker} exists`}). ${frozenOpt ? "Make the client again without frozen" : "Remove that file"} to clear it.`,
-          sellerUrl: null,
-        };
+        refusal = frozenRefusal();
         return { abort: true, reason: refusal.message };
       }
 
@@ -912,6 +914,31 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         return { abort: true, reason: refusal.message };
       }
 
+      /** The refusal for a cap the spend ledger found broken. */
+      const ledgerRefusal = (f: LedgerRefusal): NonNullable<typeof refusal> => {
+        const spent = `${atomicToUsdc(f.spent)} USDC`;
+        const cap = `${atomicToUsdc(f.cap)} USDC`;
+        if (f.rule === "first_payment") {
+          return {
+            code: "refused_max_first_payment",
+            message: `refused to pay ${usd} for ${req.url}: above maxFirstPaymentUsd ${cap} for a first payment to ${hostname}, which paidfor.dev has no listing for and this client has not paid before.${sellerLink}`,
+            sellerUrl: i.seller_url,
+          };
+        }
+        if (f.rule === "per_seller_per_day") {
+          return {
+            code: "refused_max_per_seller_per_day",
+            message: `refused to pay ${usd} for ${req.url}: ${spent} already went to ${f.seller} today (UTC), and this payment would take it over maxPerSellerPerDayUsd ${cap}.${sellerLink}`,
+            sellerUrl: i.seller_url,
+          };
+        }
+        return {
+          code: "refused_max_per_day",
+          message: `refused to pay ${usd} for ${req.url}: ${spent} already paid today (UTC), and this payment would take the day over maxPerDayUsd ${cap}.${sellerLink}`,
+          sellerUrl: i.seller_url,
+        };
+      };
+
       // 3c. The day's totals (maxPerDayUsd, maxPerSellerPerDayUsd) and the stranger cap (maxFirstPaymentUsd), 0.8.0.
       // The amount is counted against the day now, under the ledger's lock, so two processes sharing the wallet cannot
       // both pass on the same room; live() gives it back when this payment ends unpaid.
@@ -929,28 +956,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           return { abort: true, reason: failure.message };
         }
         if (!room.ok) {
-          const f = room.refusal;
-          const spent = `${atomicToUsdc(f.spent)} USDC`;
-          const cap = `${atomicToUsdc(f.cap)} USDC`;
-          if (f.rule === "first_payment") {
-            refusal = {
-              code: "refused_max_first_payment",
-              message: `refused to pay ${usd} for ${req.url}: above maxFirstPaymentUsd ${cap} for a first payment to ${hostname}, which paidfor.dev has no listing for and this client has not paid before.${sellerLink}`,
-              sellerUrl: i.seller_url,
-            };
-          } else if (f.rule === "per_seller_per_day") {
-            refusal = {
-              code: "refused_max_per_seller_per_day",
-              message: `refused to pay ${usd} for ${req.url}: ${spent} already went to ${f.seller} today (UTC), and this payment would take it over maxPerSellerPerDayUsd ${cap}.${sellerLink}`,
-              sellerUrl: i.seller_url,
-            };
-          } else {
-            refusal = {
-              code: "refused_max_per_day",
-              message: `refused to pay ${usd} for ${req.url}: ${spent} already paid today (UTC), and this payment would take the day over maxPerDayUsd ${cap}.${sellerLink}`,
-              sellerUrl: i.seller_url,
-            };
-          }
+          refusal = ledgerRefusal(room.refusal);
           return { abort: true, reason: refusal.message };
         }
         ctl.reservation = room.reservation;
@@ -1036,7 +1042,29 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         }
       }
 
-      // 8. Without an approval's nonce or a rejected one to sign again, the nonce comes from the intent (src/nonce.ts,
+      // 8. The checks above waited on the index, the balance and the approval. What can change meanwhile is checked
+      // again, right before signing: the freeze marker, and the UTC day the reservation was made on.
+      if (await isFrozen()) {
+        refusal = frozenRefusal();
+        return { abort: true, reason: refusal.message };
+      }
+      if (ctl.reservation && ledger && utcDay(new Date()) !== ctl.reservation.day) {
+        let moved: Awaited<ReturnType<SpendLedger["rollover"]>>;
+        try {
+          moved = await ledger.rollover(ctl.reservation, caps);
+        } catch (e) {
+          failure = { code: "sdk", message: `could not read or write the spend ledger ${ledger.file}; nothing was signed: ${errMsg(e)}` };
+          return { abort: true, reason: failure.message };
+        }
+        if (!moved.ok) {
+          delete ctl.reservation; // rollover removed it
+          refusal = ledgerRefusal(moved.refusal);
+          return { abort: true, reason: refusal.message };
+        }
+        ctl.reservation = moved.reservation;
+      }
+
+      // 9. Without an approval's nonce or a rejected one to sign again, the nonce comes from the intent (src/nonce.ts,
       // 0.8.0): a second signature for this purchase from a client whose state directory is gone carries the same
       // nonce, and the USDC contract settles at most one of them.
       if (!auth) auth = { nonce: deriveNonce({ intentId: r.intent_id, payer: signer.address, payTo: norm.payTo, amountAtomic: amount.toString() }) };
