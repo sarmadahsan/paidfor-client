@@ -154,7 +154,11 @@ describe("SpendLedger", () => {
       { v: 1, days: { "2026-11-23": { settled_atomic: 5, by_seller: {}, pending: {} } }, sellers: {} },
       { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: { a: "x" }, pending: {} } }, sellers: {} },
       { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: {}, pending: { p: { amount_atomic: "1" } } } }, sellers: {} },
+      { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: {}, pending: { p: { amount_atomic: "1", seller: "a", pid: "7", at: "2026-11-23T00:00:00Z" } } } }, sellers: {} },
+      { v: 1, days: { "2026-11-23": { settled_atomic: "5", by_seller: {}, pending: { p: { amount_atomic: "1", seller: "a", pid: 7 } } } }, sellers: {} },
       { v: 1, days: {}, sellers: { h: { first_paid_at: 1 } } },
+      { v: 1, days: {}, sellers: { h: { first_paid_at: "2026-11-23T00:00:00Z", last_paid_at: "2026-11-23T00:00:00Z", payments: "2" } } },
+      { v: 1, days: {}, sellers: { h: { first_paid_at: "2026-11-23T00:00:00Z", last_paid_at: "2026-11-23T00:00:00Z" } } },
     ];
     for (const b of bad) {
       const content = typeof b === "string" ? b : JSON.stringify(b);

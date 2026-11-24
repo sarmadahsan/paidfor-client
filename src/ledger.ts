@@ -77,6 +77,7 @@ export interface LedgerFile {
 const isAtomic = (v: unknown): v is string => typeof v === "string" && /^\d+$/.test(v);
 const atomic = (v: unknown): bigint => (isAtomic(v) ? BigInt(v) : 0n);
 const isMap = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 /** Whether `j` has the shape of a version 1 ledger: maps where maps are expected, atomic strings where amounts are. Anything else is not written over. */
 function isLedgerFile(j: unknown): j is LedgerFile {
@@ -84,9 +85,9 @@ function isLedgerFile(j: unknown): j is LedgerFile {
   for (const row of Object.values(j.days)) {
     if (!isMap(row) || !isAtomic(row.settled_atomic) || !isMap(row.by_seller) || !isMap(row.pending)) return false;
     if (!Object.values(row.by_seller).every(isAtomic)) return false;
-    if (!Object.values(row.pending).every((p) => isMap(p) && isAtomic(p.amount_atomic) && typeof p.seller === "string")) return false;
+    if (!Object.values(row.pending).every((p) => isMap(p) && isAtomic(p.amount_atomic) && typeof p.seller === "string" && isCount(p.pid) && typeof p.at === "string")) return false;
   }
-  return Object.values(j.sellers).every((h) => isMap(h) && typeof h.first_paid_at === "string" && typeof h.last_paid_at === "string");
+  return Object.values(j.sellers).every((h) => isMap(h) && typeof h.first_paid_at === "string" && typeof h.last_paid_at === "string" && isCount(h.payments));
 }
 
 /** The UTC day of `d` as YYYY-MM-DD. */
@@ -255,7 +256,7 @@ export class SpendLedger {
         const at = now.toISOString();
         for (const k of new Set([res.seller, res.host])) {
           const h = f.sellers[k];
-          f.sellers[k] = h ? { first_paid_at: h.first_paid_at, last_paid_at: at, payments: (h.payments ?? 0) + 1 } : { first_paid_at: at, last_paid_at: at, payments: 1 };
+          f.sellers[k] = h ? { first_paid_at: h.first_paid_at, last_paid_at: at, payments: h.payments + 1 } : { first_paid_at: at, last_paid_at: at, payments: 1 };
         }
       }
       this.prune(f, utcDay(now));
