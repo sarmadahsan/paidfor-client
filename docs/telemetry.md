@@ -117,7 +117,7 @@ Outcomes (`outcome`), mapped like the harness classifier, first match wins:
 | `wrong_goods` | A schema, entity or freshness validator failed. This client ships none of them, so it does not send this today. |
 | `overcharge` | Paid more than 1.1x the reference (index listed price, else the last price paid). Only possible if `maxOverListedRatio` was raised. |
 | `ok` | None of the above. |
-| `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** A refusal by the `authorize` option (`refused_authorize` on the receipt) sends no row at all. |
+| `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `no_acceptable_quote` | Refused; nothing was signed. **No `proof`.** A refusal by the `authorize` option (`refused_authorize` on the receipt), or by one of the 0.8.0 caps and switches (`refused_max_per_day`, `refused_max_per_seller_per_day`, `refused_max_first_payment`, `refused_pay_to`, `needs_approval`, `frozen`), sends no row at all. |
 | `paid_no_response`, `error` | Signed and sent with no response (with `proof`, `tx_hash` null), or failed before signing (no `proof`). |
 
 ### `warnings` (0.7.0): usable content in another format than declared
@@ -135,6 +135,7 @@ has no `Content-Type` header, is `ok`, not `non_delivery`. Its v2 row adds one f
 | --- | --- |
 | `content_type_mismatch` | The response's media type differs from the declared one (or from `application/json` when the seller declared none), and the body is not an HTML page, an undeclared `application/problem+json` document or JSON that fails to parse. Parameters and `+json` suffixes are the same format. |
 | `missing_content_type` | The response had no `Content-Type` header, and the body is usable by the same test. |
+| `unknown_pay_to` (0.8.0) | The quote's pay-to address was not among the addresses the index had seen this seller settle to, and the call paid anyway (`refuseUnknownPayTo` off). |
 
 Codes only: the declared and received types stay in the receipt (`receipt.warnings`), never in the row. A row without
 warnings has no `warnings` field, exactly as before. The index counts these rows as delivered (in the denominator, not

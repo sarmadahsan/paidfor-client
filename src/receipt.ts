@@ -17,6 +17,12 @@ export type Outcome =
   | "refused_ratio"
   | "refused_max_per_call"
   | "refused_authorize"
+  | "refused_max_per_day"
+  | "refused_max_per_seller_per_day"
+  | "refused_max_first_payment"
+  | "refused_pay_to"
+  | "needs_approval"
+  | "frozen"
   | "no_acceptable_quote"
   | "no_payment_required"
   | "paid_no_response"
@@ -26,11 +32,11 @@ export type Outcome =
   | "error";
 
 /**
- * Something the caller should know about a call that did not fail it (0.7.0). Today only the format rule: the paid
- * answer is usable but in another format than the seller declared (`content_type_mismatch`), or carried no
- * Content-Type header (`missing_content_type`). The outcome stays `ok`.
+ * Something the caller should know about a call that did not fail it (0.7.0). The format rule: the paid answer is
+ * usable but in another format than the seller declared (`content_type_mismatch`), or carried no Content-Type header
+ * (`missing_content_type`). The outcome stays `ok`.
  */
-export interface ReceiptWarning {
+export interface FormatWarning {
   code: "content_type_mismatch" | "missing_content_type";
   validator: ValidatorName;
   /** The media type the seller declared in its 402; null when it declared none (application/json was expected). */
@@ -39,6 +45,22 @@ export interface ReceiptWarning {
   received: string | null;
   message: string;
 }
+
+/**
+ * The quote's pay-to address is not among the addresses the index has seen this seller settle to (0.8.0). Set before
+ * signing, on paid and refused receipts alike; with `refuseUnknownPayTo` the call is refused (`refused_pay_to`) and the
+ * warning stays on the receipt. Sellers rotate addresses, so by default this is a warning.
+ */
+export interface PayToWarning {
+  code: "unknown_pay_to";
+  /** requirements.payTo, lowercase. */
+  pay_to: string;
+  /** What the index knows, lowercase. */
+  known_pay_to: string[];
+  message: string;
+}
+
+export type ReceiptWarning = FormatWarning | PayToWarning;
 
 export interface Receipt {
   v: 1;
@@ -81,7 +103,7 @@ export interface Receipt {
   index_note: string | null;
   validators: Partial<Record<ValidatorName, ValidatorResult>>;
   validator_failures: ValidatorName[];
-  /** Warnings that did not fail the call (0.7.0; absent on older receipts). See ReceiptWarning. */
+  /** Warnings that did not by themselves fail the call (0.7.0; absent on older receipts). See ReceiptWarning. */
   warnings?: ReceiptWarning[];
   settlement: { header: string | null; version: 1 | 2 | null; parsed: SettlementResponse | null; parse_error: string | null };
   tx_hash: string | null;
@@ -118,9 +140,9 @@ export interface Receipt {
   team?: TeamReceipt;
 }
 
-/** The receipt's `warnings` from the validator results: a content_type pass with a format warning. */
-export function receiptWarnings(results: Partial<Record<ValidatorName, ValidatorResult>>): ReceiptWarning[] {
-  const out: ReceiptWarning[] = [];
+/** The receipt's format warnings from the validator results: a content_type pass with a format warning. */
+export function receiptWarnings(results: Partial<Record<ValidatorName, ValidatorResult>>): FormatWarning[] {
+  const out: FormatWarning[] = [];
   const ct = results.content_type;
   if (isFormatWarning(ct)) {
     const declared = ct.evidence.expected_source === "requirements" && typeof ct.evidence.expected === "string" ? ct.evidence.expected : null;

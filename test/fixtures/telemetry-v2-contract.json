@@ -6,7 +6,7 @@
   "amount_usdc": "0.002000",
   "latency_ms": 1840,
   "validator_failures": ["http_status:500"],
-  "client": "x402-safe-fetch/0.7.2",
+  "client": "x402-safe-fetch/0.8.0",
   "proof": {
     "network": "eip155:8453",
     "scheme": "exact",

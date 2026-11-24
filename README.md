@@ -1,9 +1,10 @@
 # @paidfor/x402-safe-fetch
 
 A drop-in wrapper around the official [`@x402/fetch`](https://www.npmjs.com/package/@x402/fetch) client (2.28.x)
-that protects the buyer before and after paying. It refuses overpriced quotes and sellers rated "avoid", never
-pays twice for the same intent, and checks what it bought. No account, no key, nothing to sign up for: not to
-install it, not to read the index, and not to contribute to it.
+that checks the seller and the quote before paying and the answer after. It refuses overpriced quotes and sellers
+rated "avoid", keeps every payment under caps you set (per call, per day, per seller, and a lower one for a first
+payment to a stranger), never pays twice for the same intent, and checks what it bought. No account, no key, nothing to
+sign up for: not to install it, not to read the index, and not to contribute to it.
 
 **It reports each purchase outcome to the index by default**, with its proof of payment (see
 [Telemetry](#telemetry)). That is the deal that keeps paidfor free: the index is made from these reports. On the Free
@@ -20,8 +21,8 @@ dependency of this package (you bring the wallet), so it has to be installed nex
 without that fails with `ERR_MODULE_NOT_FOUND`.
 
 ```bash
-pnpm add @paidfor/x402-safe-fetch@0.7.2 viem
-# or: npm install @paidfor/x402-safe-fetch@0.7.2 viem
+pnpm add @paidfor/x402-safe-fetch@0.8.0 viem
+# or: npm install @paidfor/x402-safe-fetch@0.8.0 viem
 ```
 
 Save this as `pay.mjs` and run `node pay.mjs <x402 URL>` (Node 20.3 or later) with `PRIVATE_KEY` set in the
@@ -37,6 +38,7 @@ const account = privateKeyToAccount(process.env.PRIVATE_KEY);
 
 const fetchWithPay = safeFetch(account, {
   maxPerCallUsd: 0.5,
+  maxPerDayUsd: 5,             // 0.8.0: the day's total across every seller; see "Caps and switches"
   maxOverListedRatio: 1.1,     // refuse quotes more than 10% above the listed/known price
   refuseVerdicts: ["avoid"],   // consult the index; "caution" is allowed, and logged when it is paid
   indexUrl: "https://paidfor.dev/v1",
@@ -69,12 +71,18 @@ public Base RPC, and an empty wallet stops there with an `InsufficientFundsError
    with a 2-second timeout. It compares the quote to the listed price, or, when the index has none, to the last
    price this client paid for the same resource. It refuses with a `PaymentRefusedError` when the seller verdict
    is in `refuseVerdicts`, the quote exceeds `maxOverListedRatio` times the reference, or the amount exceeds
-   `maxPerCallUsd`. The error says why and links the seller page. The index is advisory: if it is down, slow or
-   answers `unknown`, the call proceeds on the local checks and the receipt says `index: "unavailable"`. Last, it
-   reads the wallet's balance of the quoted asset and throws `InsufficientFundsError` when it is below the quote
-   (0.7.2, [below](#an-empty-wallet)).
+   `maxPerCallUsd`. Since 0.8.0 it also refuses when payments are [frozen](#freeze-switch), when the quote would take
+   the day over `maxPerDayUsd` or the seller over `maxPerSellerPerDayUsd`, when a first payment to a stranger is
+   above `maxFirstPaymentUsd`, or when the amount is above `approveAbove` and no person has approved it; and it
+   warns (or, with `refuseUnknownPayTo`, refuses) when the quote's pay-to address is not one the index has seen the
+   seller use ([Caps and switches](#caps-and-switches-080)). The error says why and links the seller page. The index
+   is advisory: if it is down, slow or answers `unknown`, the call proceeds on the local checks and the receipt says
+   `index: "unavailable"`. Last, it reads the wallet's balance of the quoted asset and throws `InsufficientFundsError`
+   when it is below the quote (0.7.2, [below](#an-empty-wallet)).
 2. **Idempotency.** Every call has an `intentId`, yours or a generated one. The request hash is written to the
-   receipts directory before signing, and the signed nonce is written before the payment is sent. A retry with
+   receipts directory before signing, and the signed nonce is written before the payment is sent. Since 0.8.0 the
+   nonce itself is derived from the intent ([below](#the-nonce-comes-from-the-intent)), so even a client whose
+   receipts directory is gone signs the same nonce for the same purchase, and the USDC contract settles only one. A retry with
    the same `intentId` and request returns the stored response and never signs again. A retry with the same
    `intentId` and a different request throws `IntentConflictError`. If a payment was signed but no response was
    stored, a retry throws `IntentIndeterminateError` instead of paying again. A payment the seller rejected
@@ -93,10 +101,11 @@ public Base RPC, and an empty wallet stops there with an `InsufficientFundsError
 | Paying a seller the index rates `avoid` (or any verdict you list) | A bad seller the index has not rated yet, or any seller while the index is unreachable |
 | A quote more than `maxOverListedRatio` above the index listed price | An overpriced first purchase from a resource with no listed price and no local history |
 | A quote more than `maxOverListedRatio` above the last price this client paid | Slow price creep, if you keep accepting each step |
-| Any single payment above `maxPerCallUsd` | Total spend across many calls: there is no daily or per-seller budget |
+| Any single payment above `maxPerCallUsd`; the day's total above `maxPerDayUsd`; a seller's day above `maxPerSellerPerDayUsd`; a first payment to a stranger above `maxFirstPaymentUsd`; any amount above `approveAbove` until a person says yes; everything while frozen (0.8.0) | Spend by another wallet, or by a client with another receipts directory: the ledger is per directory |
+| Paying a pay-to address the index has not seen the seller use, when `refuseUnknownPayTo` is on (0.8.0; a warning by default) | A rotated address at a seller the index does not know, or knows without an address on record |
 | Signing for a wallet that holds less USDC than the quote (0.7.2) | A wallet emptied between the balance read and the payment, or any payment when the RPC cannot be read |
 | Paying twice for the same `intentId`, across restarts and concurrent processes | Duplicates when each retry uses a new `intentId` (pass a stable one) |
-| Re-signing after a timeout or crash once a payment was signed | Recovering that money: the call fails with the nonce so you can check the chain |
+| Re-signing after a timeout or crash once a payment was signed; and since 0.8.0 a second settlement for the same purchase even from a client whose receipts directory is gone (same nonce, so the chain rejects the second) | Recovering that money: the call fails with the nonce so you can check the chain |
 | Non-USDC assets, other networks, non-`exact` schemes, and redirects of the paid request | A seller that settles and then serves wrong or stale content that still passes the four validators |
 | Silent non-delivery: a paid 4xx/5xx, empty or truncated body, or an HTML page in place of the declared type, is flagged in the receipt | Getting the money back: validators report failures, they do not refund or dispute |
 
@@ -112,6 +121,7 @@ public Base RPC, and an empty wallet stops there with an `InsufficientFundsError
 | `insufficient_funds` (0.7.2) | The wallet holds less of the quoted asset than the quote. Nothing was signed or sent. | `false` | Thrown (`InsufficientFundsError`) |
 | `paid_no_response` | Signed and maybe sent, and no response came back. | `true` if sent | Thrown |
 | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` | Refused before signing. | `false` | Thrown |
+| `refused_max_per_day`, `refused_max_per_seller_per_day`, `refused_max_first_payment`, `refused_pay_to`, `needs_approval`, `frozen` (0.8.0) | Refused before signing by one of the [caps and switches](#caps-and-switches-080). No row is sent to the index; `reported_outcome` is null. | `false` | Thrown (`PaymentRefusedError`) |
 | `no_acceptable_quote` | No exact USDC quote on the configured network. | `false` | Thrown |
 | `no_payment_required` | The resource answered without a 402. | `false` | Returned |
 | `replayed` | The stored result of an earlier call with this `intentId`. | `false` | Returned |
@@ -136,6 +146,123 @@ JSON mislabelled, so a warning), an undeclared `application/problem+json`
 document, or a body that should be JSON and does not parse. A different `+json` type or parameters (`; charset=utf-8`)
 are the same format and raise no warning. A seller that declares no type is judged against `application/json`.
 Empty, truncated and non-2xx answers fail as before.
+
+## Caps and switches (0.8.0)
+
+Everything here runs before the signature, after the seller verdict and the price check, so a payment that is allowed
+behaves exactly as before. Each refusal is a `PaymentRefusedError` whose `code` (and the receipt's `outcome`) names the
+rule; nothing is signed, no row goes to the index, and the receipt carries the quote. None of these options is required.
+
+| Option | Default | Refuses with | What it does |
+| --- | --- | --- | --- |
+| `maxPerCallUsd` | required | `refused_max_per_call` | Any single payment above it. |
+| `maxPerDayUsd` | none | `refused_max_per_day` | The day's total (UTC), across every seller, from the spend ledger. |
+| `maxPerSellerPerDayUsd` | none | `refused_max_per_seller_per_day` | One seller's total for the day, keyed by pay-to address. |
+| `maxFirstPaymentUsd` | none | `refused_max_first_payment` | A first payment to a seller with no index listing and no local history. |
+| `approveAbove` | none | `needs_approval` | Above it, a person has to say yes: call again with `{ approved: true }`. |
+| `frozen` (or a `frozen` file) | `false` | `frozen` | Every payment, until cleared. |
+| `refuseUnknownPayTo` | `false` | `refused_pay_to` | A pay-to address the index has not seen the seller use. Default: a warning. |
+
+### Per-day cap
+
+```ts
+safeFetch(account, { maxPerCallUsd: 0.5, maxPerDayUsd: 5 });
+```
+
+`maxPerDayUsd` (USD, default none) caps what this client pays per UTC day across every seller. The quote that would
+take the day over it is refused with `refused_max_per_day`; the message says what was already paid today and the cap.
+The day's totals live in `<receiptsDir>/spend.json`, the spend ledger, written under a lock like the intent files, so
+every process that shares the directory (and the wallet) shares the cap. Before signing, the amount is reserved in the
+ledger; once the outcome is known, a paid call stays counted (with the amount signed) and anything else gives the
+reservation back. So replays, refusals, free resources and payments the seller rejected never count; a payment that
+was signed and sent and got no answer does, because the money may have moved; and a reservation whose process died
+before settling stays counted for the rest of the day. Days before yesterday are pruned. The ledger is only written when
+one of `maxPerDayUsd`, `maxPerSellerPerDayUsd` or `maxFirstPaymentUsd` is set. A ledger that cannot be read or written
+stops the payment (`sdk` error, nothing signed).
+
+In team mode the local caps apply as well, before the team is asked: a payment must pass both, as with
+`maxPerCallUsd`. The team's own budgets are not changed by them.
+
+### Per-seller cap
+
+`maxPerSellerPerDayUsd` (USD, default none) caps one seller's total per UTC day, in the same ledger, keyed by the
+quote's pay-to address in lowercase (the host, when the quote names no address). A seller that rotates its pay-to
+starts a new key. Refuses with `refused_max_per_seller_per_day`.
+
+### Stranger cap
+
+`maxFirstPaymentUsd` (USD, default none) is a lower cap for the first payment to a stranger: a seller the index has no
+listing for (it answered `unknown`, could not be reached, or `indexUrl` is `false`) and this client has never paid
+(nothing under its host or pay-to in the spend ledger, and no price for its origin in `prices.json`). Refuses with
+`refused_max_first_payment`. Once one payment to that seller has settled, `maxPerCallUsd` applies as for anyone else.
+A seller the index lists is never a stranger, whatever its verdict.
+
+### Approval threshold
+
+`approveAbove` (USD, default none): a quote above it is refused with `needs_approval` instead of being paid, and the
+message names the intent id. The receipt carries the quote (amount, pay-to, seller verdict) to show a person. When they
+agree, call again with the same `intentId` and `{ approved: true }` as the third argument: that lifts `approveAbove`
+for that call only, every other check still applies. For callers without team mode: `approveAbove` together with `team`
+(or `PAIDFOR_TEAM_KEY` in the environment) throws when the client is made, because the team's account holds the
+approval rules there (`TeamRefusedError` with `decision.approve_url`).
+
+```ts
+const f = safeFetch(account, { maxPerCallUsd: 5, approveAbove: 1 });
+try {
+  await f(url, {}, { intentId });
+} catch (e) {
+  if (e instanceof PaymentRefusedError && e.code === "needs_approval") {
+    // show e.receipt.quote to a person, then:
+    await f(url, {}, { intentId, approved: true });
+  }
+}
+```
+
+### Freeze switch
+
+Two ways, both refuse every payment with `frozen` until cleared:
+
+- `frozen: true` in the options (default `false`). Clear it by making the client again without it.
+- A file named `frozen` in the receipts directory (`touch .x402-receipts/frozen`), whatever its content. Checked
+  before every payment, so it stops a client that is already running; remove the file to clear it.
+
+Free resources (no 402) and replays of a stored intent are not payments and still go through. A frozen client does not
+wait for the index before refusing.
+
+### Pay-to check
+
+The index's answer to `/check` can carry the pay-to addresses it has seen the seller settle to (`pay_to_addresses`,
+as `/v1/sellers` and `/v1/seller/{domain}` carry them). When it does and the quote's `pay_to` is not among them, the
+receipt gets a warning:
+
+```json
+[{ "code": "unknown_pay_to", "pay_to": "0x…", "known_pay_to": ["0x…"], "message": "the quote pays 0x…, which is not among the address paidfor.dev has seen api.example.com settle to (0x…)" }]
+```
+
+The call still pays (outcome `ok`), and the v2 row carries `"warnings": ["unknown_pay_to"]`. Sellers rotate addresses
+legitimately, so this is a warning by default. `refuseUnknownPayTo: true` (default `false`) refuses instead with
+`refused_pay_to`, before signing; the warning stays on the refused receipt. A seller the index does not know, or knows
+without an address on record, gets neither the warning nor the refusal. The price book keys prices by method, origin
+and path, so a seller that keeps its price and changes its pay-to would otherwise pass without a word.
+
+### The nonce comes from the intent
+
+Since 0.8.0 the EIP-3009 nonce is not random. It is derived from the purchase:
+
+```
+nonce = HMAC-SHA256(key, JSON.stringify([intentId, payer, payTo, amountAtomic]))
+key   = "x402-safe-fetch:eip3009-nonce:v1"
+```
+
+with `payer` and `payTo` as lowercase hex and `amountAtomic` the decimal string of the quote's atomic amount; the result
+is 32 bytes as 0x-hex (`deriveNonce` is exported, so a receipt can be checked). The key is public: a nonce is only a
+uniqueness tag per payer and token contract, and nobody but the payer can sign under it. What it buys: the intent store
+already refuses to sign twice for one intent, but it lives in the receipts directory; if that directory is lost, a retry
+of the same purchase from a fresh one would have signed a second, random nonce that could also settle. Now it signs the
+same nonce, and USDC's `transferWithAuthorization` rejects the second with `AuthorizationUsed`. An approval's nonce
+(`authorize`, team mode) and a rejected payment's nonce signed again both take precedence, as before. Because pay-to
+and amount are in the derivation, the same intent id used for another seller or another price gets another nonce; the
+intent store's request hash still refuses that reuse while it exists.
 
 ### An empty wallet
 
@@ -196,9 +323,13 @@ the chain, so that check is yours.
   prices.json                            last price paid per resource (method + origin + path)
   debug.log                              telemetry failures, local only
   .verified-telemetry-notice             marks that the one-time reporting notice was shown
+  spend.json                             0.8.0: the spend ledger, with maxPerDayUsd, maxPerSellerPerDayUsd or maxFirstPaymentUsd
+  frozen                                 0.8.0: create this file to refuse every payment; remove it to clear
 ```
 
-Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, when the row was
+Since 0.8.0, with a cap that needs it, the same directory holds `spend.json` (the spend ledger: the day's totals, per
+seller, and which sellers this client has paid; `spend.lock` while it is written) and, when you create it, `frozen`
+(the freeze marker). Each receipt for a paid call has a `proof` (the same object a verified telemetry row carries) and, when the row was
 sent, a `verification_url` of the form `{indexUrl}/telemetry/<payer>/<nonce>`, which shows
 whether the index has verified your row on-chain (usually within about five minutes of the payment).
 `reported_outcome` is the outcome under the harness names, as the row reports it.
@@ -231,7 +362,7 @@ own: on the Free plan, verified rows are still sent and one line says so, once p
 
 **Plainly:** this is open source. You can edit your copy, point `indexUrl` at another index, or set
 `indexUrl: false`, which sends nothing and also turns off the seller check before paying. Opting out through the
-account is to be a Team plan feature (coming soon), not the only way out. It is the way that keeps the protections.
+account is to be a Team plan feature (coming soon), not the only way out. It is the way that keeps the checks.
 
 Every field is documented in [docs/telemetry.md](docs/telemetry.md).
 
@@ -293,9 +424,9 @@ This is the whole message, for a paid call that got a 500:
   before hashing, and the response is represented only by its sha256. Headers, request bodies, the intent id and
   validator evidence are never sent.
 - **Refusals carry no proof.** A refused or unpaid call sends the row without `proof`; it is counted as a
-  refusal, never in a failure rate. A refusal by `authorize` sends no row at all: a buyer's own rule says nothing
-  about the seller. Nor does a `payment_rejected` call (0.6.0): nothing was paid, and a wallet that cannot pay is
-  not the seller's failure.
+  refusal, never in a failure rate. A refusal by `authorize`, or by one of the 0.8.0 caps and switches, sends no row
+  at all: a buyer's own rule says nothing about the seller. Nor does a `payment_rejected` call (0.6.0): nothing was
+  paid, and a wallet that cannot pay is not the seller's failure.
 - **Outcomes use the index's names:** `ok`, `non_delivery` (a non-2xx answer or a failed delivery validator after paying),
   `overcharge` (paid more than 1.1x the reference, possible only if you raised `maxOverListedRatio`),
   `wrong_goods`, `duplicate`, plus the client-only `refused_*`, `no_acceptable_quote`, `paid_no_response` and
@@ -342,7 +473,8 @@ What you get:
 - A payment this client refuses by itself before asking the team (`refused_verdict`, `refused_ratio`,
   `refused_max_per_call`) is told to the team (`POST {origin}/v1/team/refusals`, with the quote, the reason and the
   verdict), so the ledger and the bill can show what was saved. That notice is fire-and-forget: a 2-second timeout,
-  never awaited, every failure swallowed, and the error you get is the same either way.
+  never awaited, every failure swallowed, and the error you get is the same either way. The 0.8.0 caps and switches
+  also refuse before the team is asked, and are not reported to it.
 - `project` (0.6.0) tags every payment, so the ledger and the bill can be read by project:
   `team: { key, project: "research-q4" }`. A tag is 1 to 64 letters, digits, spaces or `. _ -`; anything else throws
   when `safeFetch` is called.
@@ -407,6 +539,7 @@ own checks). Responses without a settlement (free calls, refusals) send nothing.
 | Error | `code` | Paid? |
 | --- | --- | --- |
 | `PaymentRefusedError` | `refused_verdict`, `refused_ratio`, `refused_max_per_call`, `refused_authorize` (also: a retry after `payment_rejected` whose approval names a new nonce before the old deadline) | No |
+| `PaymentRefusedError` (0.8.0) | `refused_max_per_day`, `refused_max_per_seller_per_day`, `refused_max_first_payment`, `refused_pay_to`, `needs_approval`, `frozen`: the [caps and switches](#caps-and-switches-080) | No |
 | `TeamRefusedError` (a `PaymentRefusedError`) | `refused_authorize`; `decision` says why | No |
 | `IntentConflictError` | `intent_conflict` (also: a retry after `payment_rejected` from another wallet, network or asset) | No |
 | `IntentIndeterminateError` | `intent_indeterminate` | Maybe, earlier; never again |

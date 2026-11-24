@@ -1,5 +1,5 @@
 /**
- * safeFetch: @x402/fetch with buyer protection before and after paying.
+ * safeFetch: @x402/fetch with the buyer's checks before and after paying.
  *
  * The payment plumbing is x402-audit src/x402/pay.ts: a fresh x402Client per call, checks in
  * onBeforePaymentCreation (runs before the scheme signs; `{ abort: true }` throws before any signature),
@@ -16,11 +16,13 @@ import type { ClientEvmSigner } from "@x402/evm";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { wrapFetchWithPayment } from "@x402/fetch";
 import { readBodyTee } from "./body.js";
-import { InsufficientFundsError, IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type SafeFetchErrorCode } from "./errors.js";
+import { InsufficientFundsError, IntentConflictError, IntentIndeterminateError, PaymentRefusedError, SafeFetchError, TeamRefusedError, type RefusalCode, type SafeFetchErrorCode } from "./errors.js";
 import { UNKNOWN_SELLER_NOTE, checkIndex, type IndexCheck, type Verdict } from "./index-client.js";
 import { IntentStore, type IntentLease, type StoredResponse } from "./intents.js";
+import { SpendLedger, sellerKey, type LedgerCaps, type Reservation } from "./ledger.js";
+import { deriveNonce } from "./nonce.js";
 import { PriceBook, USDC_BY_NETWORK, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic, type ReferenceSource } from "./price.js";
-import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, buildProof, failureLabels, harnessOutcome } from "./proof.js";
+import { DEFAULT_MAX_RATIO, REFUSED_OUTCOMES, UNREPORTED_REFUSALS, buildProof, failureLabels, harnessOutcome } from "./proof.js";
 import { receiptWarnings, writeReceipt, type Outcome, type Receipt } from "./receipt.js";
 import { PROJECT_RULE, TEAM_ORIGIN, TeamClient, cleanProject, outcomeFor, type TeamDecision, type TeamOptions, type TeamReceipt, type TeamRefusalReason } from "./team.js";
 import { ALL_VALIDATORS, MAX_BODY_BYTES, type ValidatorName } from "./taxonomy.js";
@@ -47,6 +49,42 @@ export type SafeNetwork = "eip155:8453" | "eip155:84532";
 export interface SafeFetchOptions {
   /** Hard cap per call, in USD (USDC). Required. */
   maxPerCallUsd: number;
+  /**
+   * Cap on what this client pays per UTC day, in USD, across every seller (0.8.0). Kept in <receiptsDir>/spend.json,
+   * shared by every process using that directory. A quote that would take the day over it is refused before signing
+   * with `refused_max_per_day`. Replays and refused or rejected payments do not count. Applies in team mode too, before
+   * the team is asked. Default: none.
+   */
+  maxPerDayUsd?: number;
+  /**
+   * Cap per seller per UTC day, in USD (0.8.0), keyed by the quote's pay-to address (the host when the quote names
+   * none). Refuses with `refused_max_per_seller_per_day`. Same ledger as `maxPerDayUsd`. Default: none.
+   */
+  maxPerSellerPerDayUsd?: number;
+  /**
+   * A lower cap, in USD, on the first payment to a stranger (0.8.0): a seller the index has no listing for (it answered
+   * unknown, could not be reached, or is off) and this client has never paid (no entry in the spend ledger or the price
+   * book). Refuses with `refused_max_first_payment`. Default: none.
+   */
+  maxFirstPaymentUsd?: number;
+  /**
+   * Above this amount, in USD, the call is refused with `needs_approval` instead of paying (0.8.0): show the quote on
+   * the receipt to a person, then call again with the same intentId and `{ approved: true }`. Not for team mode, which
+   * has its own approvals: passing both throws. Default: none.
+   */
+  approveAbove?: number;
+  /**
+   * `true` refuses every payment with `frozen` until the client is made again without it (0.8.0). The same holds while a
+   * file named `frozen` exists in `receiptsDir`, whatever its content, so a running process can be stopped from outside;
+   * remove the file to clear it. Free resources and replays are not payments and still go through. Default false.
+   */
+  frozen?: boolean;
+  /**
+   * Refuse a quote whose pay-to address is not among the addresses the index has seen this seller settle to, with
+   * `refused_pay_to` (0.8.0). Default false: the warning `unknown_pay_to` goes on the receipt instead, since sellers
+   * rotate addresses. A seller the index does not know, or knows without an address on record, gets neither.
+   */
+  refuseUnknownPayTo?: boolean;
   /** Refuse quotes above reference * ratio. Default 1.1. */
   maxOverListedRatio?: number;
   /** Seller verdicts that block payment. Default ["avoid"]. "caution", when not listed here, is logged once every check (and the approval) let the payment go ahead. */
@@ -150,6 +188,8 @@ export interface CallOptions {
    * asset throws IntentConflictError.
    */
   intentId?: string;
+  /** Lifts `approveAbove` for this call, once a person has approved the quote (0.8.0). Every other check still applies. */
+  approved?: boolean;
 }
 
 export type SafeResponse = Response & { readonly receipt: Receipt };
@@ -261,6 +301,11 @@ function resolveTeam(o: SafeFetchOptions): { team: TeamOptions; fromEnv: boolean
 
 /** Refusals the client makes by itself before the team is asked; the team is told about them (POST /v1/team/refusals). */
 const LOCAL_REFUSALS: ReadonlySet<string> = new Set<TeamRefusalReason>(["refused_verdict", "refused_ratio", "refused_max_per_call"]);
+/**
+ * Refusals the index is told about, as a row without proof. The others are the buyer's own rules (`authorize`, the caps
+ * and switches of 0.8.0) and say nothing about the seller, so no row is sent for them.
+ */
+const REPORTED_REFUSALS: ReadonlySet<RefusalCode> = new Set<RefusalCode>(["refused_verdict", "refused_ratio", "refused_max_per_call"]);
 const NONCE_RE = /^0x[0-9a-fA-F]{64}$/;
 
 function teamReceipt(origin: string, d: TeamDecision): TeamReceipt {
@@ -336,6 +381,19 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   const indexTimeoutMs = options.indexTimeoutMs ?? 2000;
   const logger = options.logger ?? console;
   const maxAtomic = usdToAtomic(options.maxPerCallUsd);
+  const usdOption = (name: string, v: number | undefined): bigint | undefined => {
+    if (v === undefined) return undefined;
+    if (typeof v !== "number" || !(Number.isFinite(v) && v > 0)) throw new TypeError(`safeFetch: ${name} must be a positive number`);
+    return usdToAtomic(v);
+  };
+  const perDay = usdOption("maxPerDayUsd", options.maxPerDayUsd);
+  const perSellerPerDay = usdOption("maxPerSellerPerDayUsd", options.maxPerSellerPerDayUsd);
+  const firstPayment = usdOption("maxFirstPaymentUsd", options.maxFirstPaymentUsd);
+  const caps: LedgerCaps = { ...(perDay !== undefined ? { perDay } : {}), ...(perSellerPerDay !== undefined ? { perSellerPerDay } : {}), ...(firstPayment !== undefined ? { firstPayment } : {}) };
+  const approveAboveAtomic = usdOption("approveAbove", options.approveAbove);
+  if (options.frozen !== undefined && typeof options.frozen !== "boolean") throw new TypeError("safeFetch: frozen must be a boolean");
+  const frozenOpt = options.frozen === true;
+  const refuseUnknownPayTo = options.refuseUnknownPayTo === true;
   const rpcUrl = options.rpcUrl === false ? undefined : (options.rpcUrl ?? RPC_BY_NETWORK[network]);
   if (rpcUrl !== undefined) {
     let ok = false;
@@ -350,7 +408,14 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
   if (!(Number.isFinite(balanceTimeoutMs) && balanceTimeoutMs > 0)) throw new TypeError("safeFetch: balanceTimeoutMs must be a positive number");
   const intents = new IntentStore(receiptsDir);
   const prices = new PriceBook(receiptsDir);
+  /** The spend ledger exists only when a cap needs it, so a client without one writes no spend.json. */
+  const ledger = perDay !== undefined || perSellerPerDay !== undefined || firstPayment !== undefined ? new SpendLedger(receiptsDir) : undefined;
+  /** The freeze marker: a file named `frozen` in the receipts directory. */
+  const frozenMarker = join(receiptsDir, "frozen");
   const teamConf = resolveTeam(options);
+  if (teamConf && approveAboveAtomic !== undefined) {
+    throw new TypeError("safeFetch: approveAbove is not used in team mode, where the account holds the approval rules; drop it, or pass team: false");
+  }
 
   const warn = (msg: string) => {
     try {
@@ -440,6 +505,17 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     }
   }
 
+  /** `frozen: true`, or the marker file. A marker that cannot be read is taken as absent. */
+  async function isFrozen(): Promise<boolean> {
+    if (frozenOpt) return true;
+    try {
+      await access(frozenMarker);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Write the receipt; a local disk failure after paying must not hide the response from the caller. */
   async function persistReceipt(r: Receipt): Promise<string | null> {
     try {
@@ -509,6 +585,11 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
    * authorization; a refused outcome never carries one.
    */
   function attachProof(r: Receipt, settledAt: number | undefined, settlement: ReturnType<typeof decodeSettlementHeader>) {
+    // A refusal by the buyer's own rules (0.8.0 caps and switches) has no name in the index's contract and sends no row.
+    if (UNREPORTED_REFUSALS.has(r.outcome)) {
+      r.reported_outcome = null;
+      return;
+    }
     const refAtomic = r.reference ? usdcStringToAtomic(r.reference.amount_usdc) : undefined;
     r.reported_outcome = harnessOutcome({
       outcome: r.outcome,
@@ -625,13 +706,36 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     return wrapResponse(stored.status, stored.statusText, stored.headers, body, stored.url || req.url, r);
   }
 
-  async function live(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number, authorize: SafeFetchOptions["authorize"]): Promise<SafeResponse> {
+  /** A payment's bookkeeping shared between live() and the hooks of one attempt. */
+  interface LiveControl {
+    /** The spend-ledger reservation made before signing, to settle once the outcome is known. */
+    reservation?: Reservation;
+    /** The amount actually signed, when it differs from the quote. */
+    signedAtomic?: bigint;
+  }
+
+  async function live(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number, authorize: SafeFetchOptions["authorize"], call: CallOptions): Promise<SafeResponse> {
+    const ctl: LiveControl = {};
+    try {
+      return await attempt(lease, req, r, t0, authorize, call, ctl);
+    } finally {
+      // The day's totals: a paid outcome (money moved, or may have: paid_no_response after sending) is counted with the
+      // amount signed; anything else gives the reservation back.
+      if (ctl.reservation && ledger) {
+        await ledger
+          .settle(ctl.reservation, r.paid, ctl.signedAtomic ?? ctl.reservation.amount)
+          .catch((e: unknown) => warn(`the spend ledger could not be updated for intent ${r.intent_id} (${errMsg(e)}); its reservation stays counted for today`));
+      }
+    }
+  }
+
+  async function attempt(lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number, authorize: SafeFetchOptions["authorize"], call: CallOptions, ctl: LiveControl): Promise<SafeResponse> {
     let quoteResult: QuoteResult | undefined;
     let indexP: Promise<IndexCheck> | undefined;
     let idx: IndexCheck | undefined;
     let quote: NormalizedRequirements | undefined;
     let approved: bigint | undefined;
-    let refusal: { code: "refused_verdict" | "refused_ratio" | "refused_max_per_call" | "refused_authorize"; message: string; sellerUrl: string | null } | undefined;
+    let refusal: { code: RefusalCode; message: string; sellerUrl: string | null } | undefined;
     // The nonce (and, from an approval, the deadline) to sign instead of the SDK's own.
     let auth: { nonce: `0x${string}`; validBefore?: bigint } | undefined;
     // An earlier attempt of this intent was signed and rejected; that authorization may still be settled until its deadline.
@@ -668,22 +772,20 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           q.asset.toLowerCase() === usdc &&
           ((q.extra?.assetTransferMethod as string | undefined) ?? "eip3009") === "eip3009",
       );
-    // With `authorize` the approval decides the nonce and deadline; after a rejected payment the old nonce is signed
-    // again. The SDK has no way to take either, so they are set here at signing and on the signed payload in
-    // onAfterPaymentCreation.
-    const schemeSigner: ClientEvmSigner =
-      !authorize && !priorRejected
-        ? signer
-        : {
-            address: signer.address,
-            signTypedData: async (m) => {
-              if (!auth || m.primaryType !== "TransferWithAuthorization") throw new Error("x402-safe-fetch: refusing to sign without an approval");
-              const message = { ...m.message, nonce: auth.nonce, ...(auth.validBefore !== undefined ? { validBefore: auth.validBefore } : {}) };
-              const signature = await signer.signTypedData({ ...m, message });
-              authSigned = true;
-              return signature;
-            },
-          };
+    // The nonce is always this client's: an approval's, a rejected one signed again, or (0.8.0) the one derived from
+    // the intent; from an approval, so is the deadline. The SDK has no way to take either, so they are set here at
+    // signing and on the signed payload in onAfterPaymentCreation. Nothing is signed before `auth` is set at the end
+    // of onBeforePaymentCreation.
+    const schemeSigner: ClientEvmSigner = {
+      address: signer.address,
+      signTypedData: async (m) => {
+        if (!auth || m.primaryType !== "TransferWithAuthorization") throw new Error("x402-safe-fetch: refusing to sign without a nonce of this client's");
+        const message = { ...m.message, nonce: auth.nonce, ...(auth.validBefore !== undefined ? { validBefore: auth.validBefore } : {}) };
+        const signature = await signer.signTypedData({ ...m, message });
+        authSigned = true;
+        return signature;
+      },
+    };
     registerExactEvmScheme(client, { signer: schemeSigner, networks: [network], policies: [policy] });
 
     client.onBeforePaymentCreation(async ({ paymentRequired, selectedRequirements }) => {
@@ -720,8 +822,19 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
       };
       const usd = `${atomicToUsdc(amount)} USDC`;
       const host = r.seller.host ?? "the seller";
+      const hostname = new URL(req.url).hostname.toLowerCase();
 
-      applyIndex(indexP ? await indexP : { available: false, note: "index not queried", host: r.seller.host, verdict: "unknown", verdict_text: null, seller_url: null, evidence_url: null, listed_price_usdc: null });
+      // 0. The freeze switch (0.8.0): the option, or a marker file in the receipts directory, refuses every payment.
+      if (await isFrozen()) {
+        refusal = {
+          code: "frozen",
+          message: `refused to pay ${usd} for ${req.url}: payments are frozen (${frozenOpt ? "frozen: true" : `the file ${frozenMarker} exists`}). ${frozenOpt ? "Make the client again without frozen" : "Remove that file"} to clear it.`,
+          sellerUrl: null,
+        };
+        return { abort: true, reason: refusal.message };
+      }
+
+      applyIndex(indexP ? await indexP : { available: false, note: "index not queried", host: r.seller.host, verdict: "unknown", verdict_text: null, seller_url: null, evidence_url: null, listed_price_usdc: null, pay_to_addresses: null });
       const i = idx!;
       const sellerLink = i.seller_url ? ` See ${i.seller_url}` : "";
 
@@ -759,6 +872,24 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         }
       }
 
+      // 2b. The pay-to address against what the index has seen this seller settle to (0.8.0). A warning by default,
+      // since sellers rotate addresses; `refuseUnknownPayTo` refuses. A seller the index does not know, or knows without
+      // an address on record, is not judged.
+      const payTo = norm.payTo.toLowerCase();
+      if (i.pay_to_addresses && !i.pay_to_addresses.includes(payTo)) {
+        const known = i.pay_to_addresses;
+        const message = `the quote pays ${payTo}, which is not among the ${known.length === 1 ? "address" : `${known.length} addresses`} paidfor.dev has seen ${host} settle to (${known.join(", ")})`;
+        r.warnings = [...(r.warnings ?? []), { code: "unknown_pay_to", pay_to: payTo, known_pay_to: known, message }];
+        if (refuseUnknownPayTo) {
+          refusal = {
+            code: "refused_pay_to",
+            message: `refused to pay ${usd} for ${req.url}: ${message}, and refuseUnknownPayTo is on.${sellerLink}`,
+            sellerUrl: i.seller_url,
+          };
+          return { abort: true, reason: refusal.message };
+        }
+      }
+
       // 3. Per-call cap.
       if (amount > maxAtomic) {
         refusal = {
@@ -767,6 +898,62 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
           sellerUrl: i.seller_url,
         };
         return { abort: true, reason: refusal.message };
+      }
+
+      // 3b. The approval threshold (0.8.0): above it a person decides, and the retry says so with { approved: true }.
+      if (approveAboveAtomic !== undefined && amount > approveAboveAtomic && call.approved !== true) {
+        refusal = {
+          code: "needs_approval",
+          message:
+            `${usd} for ${req.url} is above approveAbove ${atomicToUsdc(approveAboveAtomic)} USDC and needs a person's approval; nothing was paid. ` +
+            `Show them the quote on the receipt, then call again with intentId "${r.intent_id}" and { approved: true }.${sellerLink}`,
+          sellerUrl: i.seller_url,
+        };
+        return { abort: true, reason: refusal.message };
+      }
+
+      // 3c. The day's totals (maxPerDayUsd, maxPerSellerPerDayUsd) and the stranger cap (maxFirstPaymentUsd), 0.8.0.
+      // The amount is counted against the day now, under the ledger's lock, so two processes sharing the wallet cannot
+      // both pass on the same room; live() gives it back when this payment ends unpaid.
+      if (ledger) {
+        const seller = sellerKey(norm.payTo, hostname);
+        let known = true;
+        if (caps.firstPayment !== undefined && !i.available) {
+          known = (await ledger.hasPaid(seller, hostname).catch(() => false)) || (await prices.hasOrigin(new URL(req.url).origin).catch(() => false));
+        }
+        let room: Awaited<ReturnType<SpendLedger["reserve"]>>;
+        try {
+          room = await ledger.reserve({ seller, host: hostname, amount, caps, unlisted: !i.available, known });
+        } catch (e) {
+          failure = { code: "sdk", message: `could not read or write the spend ledger ${ledger.file}; nothing was signed: ${errMsg(e)}` };
+          return { abort: true, reason: failure.message };
+        }
+        if (!room.ok) {
+          const f = room.refusal;
+          const spent = `${atomicToUsdc(f.spent)} USDC`;
+          const cap = `${atomicToUsdc(f.cap)} USDC`;
+          if (f.rule === "first_payment") {
+            refusal = {
+              code: "refused_max_first_payment",
+              message: `refused to pay ${usd} for ${req.url}: above maxFirstPaymentUsd ${cap} for a first payment to ${hostname}, which paidfor.dev has no listing for and this client has not paid before.${sellerLink}`,
+              sellerUrl: i.seller_url,
+            };
+          } else if (f.rule === "per_seller_per_day") {
+            refusal = {
+              code: "refused_max_per_seller_per_day",
+              message: `refused to pay ${usd} for ${req.url}: ${spent} already went to ${f.seller} today (UTC), and this payment would take it over maxPerSellerPerDayUsd ${cap}.${sellerLink}`,
+              sellerUrl: i.seller_url,
+            };
+          } else {
+            refusal = {
+              code: "refused_max_per_day",
+              message: `refused to pay ${usd} for ${req.url}: ${spent} already paid today (UTC), and this payment would take the day over maxPerDayUsd ${cap}.${sellerLink}`,
+              sellerUrl: i.seller_url,
+            };
+          }
+          return { abort: true, reason: refusal.message };
+        }
+        ctl.reservation = room.reservation;
       }
 
       // 4. A rejected authorization of this intent is reused only by the same payer, on the same network, for the same
@@ -849,6 +1036,11 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         }
       }
 
+      // 8. Without an approval's nonce or a rejected one to sign again, the nonce comes from the intent (src/nonce.ts,
+      // 0.8.0): a second signature for this purchase from a client whose state directory is gone carries the same
+      // nonce, and the USDC contract settles at most one of them.
+      if (!auth) auth = { nonce: deriveNonce({ intentId: r.intent_id, payer: signer.address, payTo: norm.payTo, amountAtomic: amount.toString() }) };
+
       approved = amount;
       try {
         await lease.update({ phase: "signing", amount_atomic: amount.toString(), pay_to: norm.payTo });
@@ -894,14 +1086,13 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         failure = { code: "sdk", message: `signed to ${to} does not match requirements.payTo ${quote?.payTo}` };
         throw new Error(failure.message);
       }
-      if (auth) {
-        if (!authSigned) {
-          failure = { code: "sdk", message: "the payment was not signed with the approval's nonce" };
-          throw new Error(failure.message);
-        }
-        a.nonce = auth.nonce;
-        if (auth.validBefore !== undefined) a.validBefore = auth.validBefore.toString();
+      if (!auth || !authSigned) {
+        failure = { code: "sdk", message: "the payment was not signed with this client's nonce" };
+        throw new Error(failure.message);
       }
+      a.nonce = auth.nonce;
+      if (auth.validBefore !== undefined) a.validBefore = auth.validBefore.toString();
+      ctl.signedAtomic = BigInt(value);
       r.nonce = String(a.nonce);
       const vb = Number(a.validBefore);
       r.valid_before = Number.isSafeInteger(vb) ? vb : null;
@@ -961,7 +1152,9 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     try {
       res = await fetchWithPayment(req.url, reqInit);
     } catch (e) {
-      await settleIndex();
+      // The freeze switch does not wait for the index: the receipt says so and keeps whatever the index had answered.
+      if (refusal?.code === "frozen" && !idx) r.index_note = "not waited for: payments are frozen";
+      else await settleIndex();
       if (refusal) {
         finish(r, t0, refusal.code);
         r.error = { code: refusal.code, message: refusal.message };
@@ -969,7 +1162,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
         await lease.update({ phase: "refused" }).catch(() => undefined);
         await persistReceipt(r);
         // A buyer's own rule says nothing about the seller, so it is not reported to the index.
-        if (refusal.code !== "refused_authorize") emitTelemetry(r);
+        if (REPORTED_REFUSALS.has(refusal.code)) emitTelemetry(r);
         throw new PaymentRefusedError(refusal.code, `x402-safe-fetch ${refusal.message}`, refusal.sellerUrl, r);
       }
       if (signedRecorded) {
@@ -1031,7 +1224,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     );
     r.validators = results;
     r.validator_failures = (Object.entries(results) as [ValidatorName, { status: string }][]).filter(([, v]) => v.status === "fail").map(([k]) => k);
-    r.warnings = receiptWarnings(results);
+    r.warnings = [...(r.warnings ?? []), ...receiptWarnings(results)];
     r.response = {
       status: res.status,
       content_type: res.headers.get("content-type"),
@@ -1126,15 +1319,15 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     try {
       const r = baseReceipt(req, intentId, requestHash, t0);
       if (lease.replay) return await replay(lease, req, r, t0);
-      if (!team) return await live(lease, req, r, t0, options.authorize);
-      return await teamLive(team, lease, req, r, t0);
+      if (!team) return await live(lease, req, r, t0, options.authorize, call);
+      return await teamLive(team, lease, req, r, t0, call);
     } finally {
       await lease.release();
     }
   };
 
   /** live() with the team asked before signing, and every approval's outcome reported after. */
-  async function teamLive(team: TeamClient, lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number): Promise<SafeResponse> {
+  async function teamLive(team: TeamClient, lease: IntentLease, req: NormalizedRequest, r: Receipt, t0: number, call: CallOptions): Promise<SafeResponse> {
     const project = teamConf?.project;
     let decision: TeamDecision | undefined;
     const authorize = async (q: AuthorizeRequest): Promise<AuthorizeAnswer> => {
@@ -1156,7 +1349,7 @@ export function safeFetch(wallet: WalletLike, options: SafeFetchOptions): SafeFe
     };
     let res: SafeResponse;
     try {
-      res = await live(lease, req, r, t0, authorize);
+      res = await live(lease, req, r, t0, authorize, call);
     } catch (e) {
       if (e instanceof PaymentRefusedError && LOCAL_REFUSALS.has(e.code) && e.receipt?.quote) {
         // Refused before the team was asked: tell it, so the ledger counts what was saved. Never awaited, never thrown.

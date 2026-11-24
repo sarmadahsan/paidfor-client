@@ -1,5 +1,8 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic } from "../src/price.js";
+import { PriceBook, atomicToUsdc, exceedsRatio, quoteRatio, resourceKey, usdToAtomic, usdcStringToAtomic } from "../src/price.js";
 
 describe("price", () => {
   it("converts USD caps to atomic units without loosening them", () => {
@@ -26,5 +29,21 @@ describe("price", () => {
   });
   it("resource key drops the query string", () => {
     expect(resourceKey("get", "https://a.example.com/x/?q=1")).toBe("GET https://a.example.com/x");
+  });
+  it("the price book knows which origins this client has paid (0.8.0)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "x402-prices-"));
+    try {
+      const book = new PriceBook(dir);
+      await book.set(resourceKey("GET", "https://a.example.com/x?q=1"), 10n);
+      await book.set(resourceKey("POST", "https://root.example.com/"), 10n);
+      expect(await book.hasOrigin("https://a.example.com")).toBe(true);
+      expect(await book.hasOrigin("https://A.example.com")).toBe(true);
+      expect(await book.hasOrigin("https://root.example.com")).toBe(true);
+      expect(await book.hasOrigin("https://a.example.co")).toBe(false);
+      expect(await book.hasOrigin("https://b.example.com")).toBe(false);
+      expect(await new PriceBook(join(dir, "none")).hasOrigin("https://a.example.com")).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

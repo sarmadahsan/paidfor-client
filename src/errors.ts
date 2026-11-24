@@ -1,11 +1,26 @@
 import type { Receipt } from "./receipt.js";
 import type { TeamDecision } from "./team.js";
 
-export type SafeFetchErrorCode =
+/**
+ * The reasons a payment is refused before any signature. The first four are from 0.1; the rest are the 0.8.0 controls:
+ * `refused_max_per_day` (`maxPerDayUsd`), `refused_max_per_seller_per_day` (`maxPerSellerPerDayUsd`),
+ * `refused_max_first_payment` (`maxFirstPaymentUsd`), `refused_pay_to` (`refuseUnknownPayTo`), `needs_approval`
+ * (`approveAbove`) and `frozen` (`frozen`, or the marker file).
+ */
+export type RefusalCode =
   | "refused_verdict"
   | "refused_ratio"
   | "refused_max_per_call"
   | "refused_authorize"
+  | "refused_max_per_day"
+  | "refused_max_per_seller_per_day"
+  | "refused_max_first_payment"
+  | "refused_pay_to"
+  | "needs_approval"
+  | "frozen";
+
+export type SafeFetchErrorCode =
+  | RefusalCode
   | "no_acceptable_quote"
   | "insufficient_funds"
   | "intent_conflict"
@@ -28,11 +43,11 @@ export class SafeFetchError extends Error {
   }
 }
 
-/** Refused before any signature: seller verdict, price ratio, per-call cap, or `authorize`. Nothing was paid. */
+/** Refused before any signature: seller verdict, price ratio, a cap, a pay-to the index does not know, an approval threshold, the freeze switch, or `authorize`. Nothing was paid. */
 export class PaymentRefusedError extends SafeFetchError {
   override name = "PaymentRefusedError";
   constructor(
-    code: "refused_verdict" | "refused_ratio" | "refused_max_per_call" | "refused_authorize",
+    code: RefusalCode,
     message: string,
     readonly sellerUrl: string | null,
     receipt?: Receipt,
